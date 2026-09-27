@@ -52,6 +52,12 @@ test('a handled Promise rejection does not terminate a healthy app', async () =>
   finally { await rm(f.dir, { recursive: true, force: true }); }
 });
 
+test('programmatic input updates do not recursively re-enter JavaScript', async () => {
+  const f = await fixture(`import {createApp,ui,log} from '@cpzero/core'; createApp({setup(root){const input=ui.input(root,{value:'before',onChange(){throw new Error('unexpected recursive change')}});input.update({value:'after'});log('UPDATE_OK')}});`);
+  try { const r = f.run(); assert.equal(r.status, 0, r.stderr); assert.match(r.stdout, /UPDATE_OK/); }
+  finally { await rm(f.dir, { recursive: true, force: true }); }
+});
+
 test('infinite startup and Promise work are interrupted instead of hanging', async () => {
   for (const source of ['while(true){}', 'Promise.resolve().then(()=>{while(true){}})']) {
     const f = await fixture(source);

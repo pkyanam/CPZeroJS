@@ -378,6 +378,10 @@ static void dispatch(Host *h, uint32_t id, const char *event,
 }
 static void onLvEvent(lv_event_t *e) {
   auto *h = G;
+  // Programmatic setters can synchronously trigger LVGL change events. Do not
+  // re-enter JS (or reset its execution deadline) from inside a native binding.
+  if (!h->running || h->deadlineActive)
+    return;
   uint32_t id = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
   auto it = h->widgets.find(id);
   if (it == h->widgets.end())
