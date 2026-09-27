@@ -1,0 +1,9 @@
+{
+  "name": "@cpzero/cli",
+  "version": "0.1.0",
+  "description": "Build and run CPZeroJS apps on the native simulator",
+  "type": "module",
+  "bin": { "cpzero": "./src/index.mjs" },
+  "files": ["src/index.mjs", "src/index.d.mts"],
+  "dependencies": { "esbuild": "^0.25.0" }
+}

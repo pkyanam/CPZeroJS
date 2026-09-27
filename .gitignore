@@ -1,0 +1,8 @@
+node_modules/
+dist/
+native/build*/
+.cache/
+.cpzero/
+*.ppm
+*.log
+.DS_Store

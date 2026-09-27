@@ -1,0 +1,33 @@
+name: Verify CPZeroJS
+on: [push, pull_request]
+jobs:
+  verify:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libsdl2-dev cmake ninja-build pkg-config
+      - name: Install Mac native dependencies
+        if: runner.os == 'macOS'
+        run: brew install sdl2 ninja pkg-config
+      - run: npm ci
+      - run: npm run check
+      - run: npm run native
+      - run: npm run test:native
+      - name: Compile Linux framebuffer backend
+        if: runner.os == 'Linux'
+        run: |
+          cmake -S native -B native/build-fbdev -DCPZERO_BACKEND=FBDEV -DCMAKE_BUILD_TYPE=Release
+          cmake --build native/build-fbdev --parallel 2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: preview-${{ matrix.os }}
+          path: .cpzero/test-output/
