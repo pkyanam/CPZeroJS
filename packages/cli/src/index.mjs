@@ -3,7 +3,7 @@ import { build, context } from "esbuild";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { access, mkdir, rename, rm, writeFile, readdir } from "node:fs/promises";
+import { access, mkdir, rename, rm, writeFile, readdir, symlink, readlink } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 const cliDir = path.dirname(fileURLToPath(import.meta.url));
@@ -49,7 +49,7 @@ function entryPath(cwd, entry) {
 }
 function coreResolve(root, cwd) {
   if (path.resolve(cwd) !== root) return void 0;
-  return { "@cpzero/core": path.join(root, "packages/core/src/index.ts") };
+  return { "@cpzero/core": path.join(root, "packages/core/src/index.ts"), "@cpzero/codex": path.join(root, "packages/codex/src/index.ts") };
 }
 async function bundleApp(cwd, entry, outfile, root = repoRoot, write = true) {
   const opts = {
@@ -87,6 +87,27 @@ function nativeHost(root) {
 }
 async function runHost(host, bundle, args, cwd) {
   await access(host);
+  // A real app bundle gives the Mac simulator a Dock identity and reliable focus.
+  if (process.platform === "darwin" && !args.includes("--headless") && !process.env.CPZERO_HOST) {
+    const contents = path.join(cwd, ".cpzero/CPZeroJS.app/Contents");
+    const binary = path.join(contents, "MacOS/cpzero-host");
+    await mkdir(path.dirname(binary), { recursive: true });
+    await writeFile(path.join(contents, "Info.plist"), `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>dev.cpzero.simulator</string>
+<key>CFBundleName</key><string>CPZeroJS</string>
+<key>CFBundleExecutable</key><string>cpzero-host</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleVersion</key><string>0.2.0</string>
+<key>NSHighResolutionCapable</key><true/>
+</dict></plist>
+`);
+    if (await readlink(binary).catch(() => "") !== host) {
+      await rm(binary, { force: true });
+      await symlink(host, binary);
+    }
+    host = binary;
+  }
   const child = spawn(host, [bundle, ...args], { cwd, stdio: "inherit", env: { ...process.env, CPZERO_DATA_DIR: process.env.CPZERO_DATA_DIR ?? path.join(cwd, ".cpzero/data") } });
   child.on("error", (e) => console.error(`cpzero: simulator failed: ${e.message}`));
   return child;

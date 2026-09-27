@@ -1,3 +1,5 @@
+> Historical v0.1 design contract. For current interfaces, use [API](api.md), [services](services.md), and [architecture](architecture.md).
+
 # CPZeroJS implementation contract (v0.1)
 
 Workspace: npm workspaces, TypeScript SDK package `@cpzero/core`, CLI package `@cpzero/cli` (binary `cpzero`). Native host: C/C++, LVGL 9, QuickJS, SDL desktop + Linux framebuffer backend. App source: src/main.ts bundled IIFE, no Node/browser runtime dependency. Default demo: examples/dashboard/src/main.ts.

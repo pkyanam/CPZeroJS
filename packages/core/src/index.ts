@@ -1,15 +1,37 @@
+export { disclosure, focusScope } from "./components";
+export type { DisclosureOptions, DisclosureController, FocusScopeOptions, FocusScopeController } from "./components";
+export { markdown, parseMarkdown } from "./markdown";
+export type { MarkdownDocument, MarkdownBlock, MarkdownSpan, MarkdownOptions, MarkdownView } from "./markdown";
+export { createTheme, defaultTheme, defineRecipe, scopedTheme } from "./theme";
+export type { ThemeTokens, ThemeOverrides, ThemeRecipe, ThemeScope, RecipeSelections, RecipeDefinition } from "./theme";
+import { pumpIO, disposeIO } from "./io";
+export { processes, Process, http } from "./io";
+export type { ProcessOptions, HttpOptions, HttpResponse, HttpTask } from "./io";
+
 /** CPZeroJS: a small, host-neutral UI and service SDK for CPZero devices. */
 
-export type WidgetKind = "screen" | "column" | "row" | "label" | "button" | "input" | "bar" | "box";
+export type WidgetKind = "screen" | "column" | "row" | "label" | "button" | "input" | "bar" | "box" | "richText";
+export type Size = number | "content" | `${number}%`;
+export type KeyModifiers = { ctrl: boolean; shift: boolean; alt: boolean; meta: boolean };
+export type KeyEvent = KeyModifiers & { key: string };
 export type WidgetValue = string | number | boolean | undefined;
+export type TextSpan = { text: string; color?: string; fontSize?: number };
 export type WidgetProps = {
-  text?: string; width?: number | "100%"; height?: number | "100%"; grow?: number;
+  spans?: TextSpan[];
+  text?: string; width?: Size; height?: Size; grow?: number;
   gap?: number; padding?: number; bg?: string; color?: string; fontSize?: number;
   value?: string | number; min?: number; max?: number; hidden?: boolean; disabled?: boolean;
-  onPress?: () => void; onChange?: (value: string) => void;
+  minWidth?: number; maxWidth?: number; minHeight?: number; maxHeight?: number;
+  paddingX?: number; paddingY?: number; radius?: number; borderWidth?: number; borderColor?: string; focusColor?: string; opacity?: number;
+  align?: "start" | "center" | "end"; justify?: "start" | "center" | "end" | "between";
+  textAlign?: "left" | "center" | "right"; overflow?: "wrap" | "ellipsis" | "clip";
+  scroll?: "none" | "vertical" | "horizontal" | "both"; focusable?: boolean;
+  placeholder?: string; multiline?: boolean; maxLength?: number; lineSpacing?: number;
+  onPress?: () => void; onChange?: (value: string) => void; onSubmit?: (value: string) => void;
+  onFocus?: () => void; onBlur?: () => void; onScroll?: (value: string) => void;
   [extension: string]: unknown;
 };
-export type NativeProps = Omit<WidgetProps, "onPress" | "onChange">;
+export type NativeProps = Omit<WidgetProps, "onPress" | "onChange" | "onSubmit" | "onFocus" | "onBlur" | "onScroll">;
 export type NativeBridge = {
   create(kind: string, parent: number, props: NativeProps): number;
   update(id: number, props: NativeProps): void;
@@ -17,8 +39,9 @@ export type NativeBridge = {
   log(message: string): void;
   invoke(service: string, method: string, jsonArgs: string): string;
   stats(): Record<string, unknown>;
+  command?(id: number, action: string, arg?: unknown): unknown;
 };
-export type WidgetEvent = "press" | "change";
+export type WidgetEvent = "press" | "change" | "submit" | "focus" | "blur" | "scroll";
 export type Cleanup = () => void;
 export type Signal<T> = { value: T; subscribe(listener: (value: T) => void): Cleanup };
 
@@ -26,6 +49,7 @@ declare global {
   // Installed by the native host. These declarations also make the SDK usable in bundlers.
   var __cp: NativeBridge | undefined;
   var __cpDispatch: ((id: number, event: WidgetEvent, value?: string) => void) | undefined;
+  var __cpKey: ((key: string, modifiers: KeyModifiers) => boolean) | undefined;
   var __cpTick: ((nowMs: number) => void) | undefined;
 }
 
@@ -47,6 +71,7 @@ export class App {
   readonly root: Widget;
   private readonly widgets = new Map<number, Widget>();
   private readonly cleanups = new Set<Cleanup>();
+  private readonly keyHandlers = new Set<(event: KeyEvent) => boolean | void>();
   private readonly timers = new Map<number, Timer>();
   private disposed = false;
   private lastTick = 0;
@@ -58,6 +83,7 @@ export class App {
     catch (error) { activeApp = undefined; throw error; }
     globalThis.__cpDispatch = (id, event, value) => activeApp?.dispatch(id, event, value);
     globalThis.__cpTick = (nowMs) => activeApp?.tick(nowMs);
+    globalThis.__cpKey = (key, modifiers) => { for (const fn of [...this.keyHandlers]) if (fn({ key, ...modifiers }) === true) return true; return false; };
     try { options.setup(this.root); }
     catch (error) { this.dispose(); throw error; }
   }
@@ -68,6 +94,8 @@ export class App {
     if (this.disposed) return;
     this.disposed = true;
     this.timers.clear();
+    this.keyHandlers.clear();
+    disposeIO();
     for (const cleanup of [...this.cleanups]) releaseCleanup(cleanup);
     this.cleanups.clear();
     // Descendants first, with no recursion or repeated tree walks.
@@ -81,6 +109,7 @@ export class App {
       activeApp = undefined;
       globalThis.__cpDispatch = undefined;
       globalThis.__cpTick = undefined;
+      globalThis.__cpKey = undefined;
     }
   }
 
@@ -90,6 +119,8 @@ export class App {
     this.cleanups.add(cleanup);
     return () => this.cleanups.delete(cleanup);
   }
+
+  onKey(handler: (event: KeyEvent) => boolean | void): Cleanup { this.assertLive(); this.keyHandlers.add(handler); return () => { this.keyHandlers.delete(handler); }; }
 
   every(ms: number, fn: () => void): Cleanup { return this.addTimer(ms, fn, ms); }
   after(ms: number, fn: () => void): Cleanup { return this.addTimer(ms, fn, 0); }
@@ -105,6 +136,7 @@ export class App {
   private tick(nowMs: number): void {
     if (this.disposed || !Number.isFinite(nowMs)) return;
     this.lastTick = Math.max(this.lastTick, nowMs);
+    pumpIO();
     // Snapshot IDs so callbacks may safely cancel or add timers during dispatch.
     const dueIds: number[] = [];
     for (const timer of this.timers.values()) if (timer.due <= this.lastTick) dueIds.push(timer.id);
@@ -119,12 +151,16 @@ export class App {
 
   private makeWidget(kind: WidgetKind, parentId: number, props: WidgetProps): Widget {
     this.assertLive();
-    const { onPress, onChange, ...nativeProps } = props;
+    const { onPress, onChange, onSubmit, onFocus, onBlur, onScroll, ...nativeProps } = props;
     const id = native().create(kind, parentId, nativeProps);
     const widget = new Widget(this, id, kind);
     this.widgets.set(id, widget);
     widget.setPropHandler("press", onPress);
     widget.setPropHandler("change", onChange);
+    widget.setPropHandler("submit", onSubmit);
+    widget.setPropHandler("focus", onFocus);
+    widget.setPropHandler("blur", onBlur);
+    widget.setPropHandler("scroll", onScroll);
     return widget;
   }
 
@@ -176,12 +212,30 @@ export class Widget {
 
   update(props: WidgetProps): this {
     this.app.assertOwned(this);
-    const { onPress, onChange, ...nativeProps } = props;
+    const { onPress, onChange, onSubmit, onFocus, onBlur, onScroll, ...nativeProps } = props;
     native().update(this.id, nativeProps);
     if (Object.hasOwn(props, "onPress")) this.setPropHandler("press", onPress);
     if (Object.hasOwn(props, "onChange")) this.setPropHandler("change", onChange);
+    if (Object.hasOwn(props, "onSubmit")) this.setPropHandler("submit", onSubmit);
+    if (Object.hasOwn(props, "onFocus")) this.setPropHandler("focus", onFocus);
+    if (Object.hasOwn(props, "onBlur")) this.setPropHandler("blur", onBlur);
+    if (Object.hasOwn(props, "onScroll")) this.setPropHandler("scroll", onScroll);
     return this;
   }
+
+  command(action: string, arg?: unknown): unknown {
+    this.app.assertOwned(this);
+    const bridge = native();
+    if (!bridge.command) throw new Error("Widget commands require CPZeroJS native host v0.2+");
+    return bridge.command(this.id, action, arg);
+  }
+  focus(): this { this.command("focus"); return this; }
+  scrollTo(y: number): this { this.command("scrollTo", y); return this; }
+  scrollBy(y: number): this { this.command("scrollBy", y); return this; }
+  scrollToEnd(): this { this.command("scrollToEnd"); return this; }
+  isFocused(): boolean { return this.command("isFocused") === true; }
+  getValue(): string { return String(this.command("getValue") ?? ""); }
+  getScrollY(): number { return Number(this.command("getScrollY") ?? 0); }
 
   on(event: WidgetEvent, callback: Handler): Cleanup {
     this.app.assertOwned(this);
@@ -237,6 +291,12 @@ export function createApp(options: { title?: string; setup(root: Widget): void }
 
 /** Composition API for the native widgets available in v0.1. */
 export const ui = {
+  richText(parent: Widget, props: WidgetProps = {}): Widget { return parent.app.create(parent, "richText", { width: "100%", height: "content", fontSize: 12, ...props }); },
+  text(parent: Widget, props: WidgetProps = {}): Widget { return parent.app.create(parent, "label", { fontSize: 12, overflow: "wrap", ...props }); },
+  panel(parent: Widget, props: WidgetProps = {}): Widget { return parent.app.create(parent, "column", { width: "100%", padding: 4, gap: 3, radius: 4, ...props }); },
+  scroll(parent: Widget, props: WidgetProps = {}): Widget { return parent.app.create(parent, "column", { width: "100%", height: "100%", padding: 0, gap: 3, scroll: "vertical", ...props }); },
+  spacer(parent: Widget, props: WidgetProps = {}): Widget { return parent.app.create(parent, "box", { width: 1, height: 1, grow: 1, padding: 0, ...props }); },
+  divider(parent: Widget, props: WidgetProps = {}): Widget { return parent.app.create(parent, "box", { width: "100%", height: 1, padding: 0, bg: "#263347", ...props }); },
   column(parent: Widget, props: WidgetProps = {}): Widget { return parent.app.create(parent, "column", props); },
   row(parent: Widget, props: WidgetProps = {}): Widget { return parent.app.create(parent, "row", props); },
   label(parent: Widget, props: WidgetProps = {}): Widget { return parent.app.create(parent, "label", props); },
@@ -246,7 +306,7 @@ export const ui = {
   box(parent: Widget, props: WidgetProps = {}): Widget { return parent.app.create(parent, "box", props); },
   /** Extend host-supported widget kinds. Rendering still requires matching native support. */
   custom(parent: Widget, kind: string, props: WidgetProps = {}): Widget {
-    if (!kind || ["screen", "column", "row", "label", "button", "input", "bar", "box"].includes(kind)) {
+    if (!kind || ["screen", "column", "row", "label", "button", "input", "bar", "box", "richText"].includes(kind)) {
       throw new Error("ui.custom requires a non-empty custom kind; use the built-in factory for built-ins.");
     }
     return parent.app.create(parent, kind as WidgetKind, props);
@@ -414,3 +474,37 @@ export const storage = {
 
 export const log = (message: string): void => native().log(String(message));
 export const stats = (): Record<string, unknown> => native().stats();
+
+/** Keyboard shortcuts are scoped to the active application. Return true to consume a key. */
+export const keyboard = {
+  on(handler: (event: KeyEvent) => boolean | void): Cleanup {
+    if (!activeApp) throw new Error("Keyboard handlers need a running app.");
+    return activeApp.onKey(handler);
+  },
+};
+export const display = Object.freeze({ width: 320, height: 170 });
+export const tokens = Object.freeze({ space: { xs: 2, sm: 4, md: 6, lg: 8 }, font: { tiny: 8, caption: 10, body: 12, heading: 14, title: 16, display: 20 } });
+
+/** Discrete, allocation-light zoom state. Bind to font sizes or other app dimensions. */
+export function createZoom(options: { levels?: readonly number[]; initial?: number } = {}) {
+  const levels = [...(options.levels ?? [8, 10, 12, 14, 16, 20])];
+  if (!levels.length || levels.length > 32 || levels.some((n, i) => !Number.isFinite(n) || n <= 0 || (i > 0 && n <= levels[i - 1]))) {
+    throw new RangeError("Zoom levels must contain 1–32 increasing positive numbers.");
+  }
+  const initial = options.initial ?? 12;
+  if (!Number.isFinite(initial)) throw new RangeError("Initial zoom must be finite.");
+  function closest(value: number) { return levels.reduce((best, n, i) => Math.abs(n - value) < Math.abs(levels[best] - value) ? i : best, 0); }
+  let index = closest(initial);
+  const state = signal(levels[index]);
+  const setIndex = (next: number) => { index = Math.max(0, Math.min(levels.length - 1, next)); state.value = levels[index]; };
+  return {
+    get value() { return state.value; },
+    get canZoomIn() { return index < levels.length - 1; },
+    get canZoomOut() { return index > 0; },
+    subscribe: state.subscribe,
+    zoomIn() { setIndex(index + 1); },
+    zoomOut() { setIndex(index - 1); },
+    reset() { setIndex(closest(initial)); },
+    set(value: number) { if (!Number.isFinite(value)) throw new RangeError("Zoom must be finite."); setIndex(closest(value)); },
+  };
+}

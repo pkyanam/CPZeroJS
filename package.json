@@ -1,6 +1,6 @@
 {
   "name": "cpzerojs",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "TypeScript apps. Native pixels. Built for Cardputer Zero.",
   "type": "module",
@@ -14,11 +14,13 @@
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test tests/*.test.ts",
     "check": "npm run typecheck && npm test && npm run build",
-    "test:native": "node --test tests/native.test.mjs",
+    "test:native": "node --test tests/native*.test.mjs",
     "dev:catalog": "node packages/cli/src/index.mjs dev examples/catalog/src/main.ts",
     "doctor": "node packages/cli/src/index.mjs doctor",
     "package:device": "bash scripts/package-device.sh",
-    "benchmark": "node scripts/benchmark.mjs"
+    "benchmark": "node scripts/benchmark.mjs",
+    "dev:codex": "node packages/cli/src/index.mjs dev examples/codex/src/main.ts",
+    "build:codex": "node packages/cli/src/index.mjs build examples/codex/src/main.ts"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

@@ -6,9 +6,23 @@
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true,
-    "types": ["node"],
+    "types": [
+      "node"
+    ],
     "baseUrl": ".",
-    "paths": { "@cpzero/core": ["packages/core/src/index.ts"] }
+    "paths": {
+      "@cpzero/core": [
+        "packages/core/src/index.ts"
+      ],
+      "@cpzero/codex": [
+        "packages/codex/src/index.ts"
+      ]
+    }
   },
-  "include": ["packages/core/src/**/*.ts", "examples/**/*.ts", "tests/**/*.ts"]
+  "include": [
+    "packages/core/src/**/*.ts",
+    "examples/**/*.ts",
+    "tests/**/*.ts",
+    "packages/codex/src/**/*.ts"
+  ]
 }

@@ -14,7 +14,7 @@ jobs:
           cache: npm
       - name: Install Linux native dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libsdl2-dev cmake ninja-build pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libsdl2-dev libcurl4-openssl-dev cmake ninja-build pkg-config
       - name: Install Mac native dependencies
         if: runner.os == 'macOS'
         run: brew install sdl2 ninja pkg-config

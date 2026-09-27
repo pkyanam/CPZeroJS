@@ -1,65 +1,108 @@
 # CPZeroJS
 
-**Build TypeScript apps for the Cardputer Zero, and preview them on your Mac.**
+**Small native apps. TypeScript ergonomics. Built for Cardputer Zero.**
 
-![Dashboard rendered by the native runtime at 320 × 170](docs/assets/dashboard.png)
+CPZeroJS is an **application SDK and framework**: compose interfaces in TypeScript, bundle them to JavaScript, and run them inside a small C++ engine. QuickJS executes your code; LVGL draws the widgets. Preview the same 320 × 170 layout on your Mac with live reload.
 
-CPZeroJS is an application SDK and development toolchain: TypeScript app code is bundled to JavaScript, then a native C++ host runs it in QuickJS and draws the interface with LVGL. The package is an early v0.1 foundation, with a small widget set and service extension point. The native host supports an SDL desktop simulator and a Linux framebuffer backend. Physical Cardputer Zero validation is still pending.
+This targets the **Linux-based M5Stack Cardputer Zero**, not the original Cardputer or Cardputer ADV. This is an early v0.2 SDK: the Mac simulator works; physical Zero compatibility and performance remain to be validated.
 
-“SDK” is the clearest name for the developer-facing library and tools. “Framework” also fits the lifecycle and UI conventions. CPZeroJS includes both.
+![Native Codex demo: charcoal theme, Markdown reply, rounded controls](docs/assets/codex.png)
 
-## Start here
+*Actual native rendering at 320 × 170, using a reply from the installed Codex CLI.*
 
-On macOS, install the desktop build tools, then install project dependencies and build the native host:
+## Run it
 
 ```sh
 brew install cmake ninja sdl2 pkg-config
 npm install
 npm run native
-npm run dev
+npm run dev:codex
 ```
 
-Try the 10,000-item paged catalog with `npm run dev:catalog`. Run `npm run doctor` to check setup and `npm run benchmark` for the sample app's runtime allocation report.
+The Codex demo wraps your installed `codex` CLI and uses its existing login. Run `codex login` first if needed. It streams replies, interrupts turns, and presents explicit approval/input dialogs. [Codex demo guide →](docs/codex.md)
 
-The SDL simulator uses a fixed 320 × 170 logical display shown at 3× scale. Source edits rebuild the bundle and reload the native host; reload resets in-memory app state.
+| Control | Action |
+| --- | --- |
+| Enter | Send from the composer |
+| Tab / Shift+Tab | Move focus |
+| Escape | Stop the turn / dismiss a request |
+| Ctrl+N / Cmd+N | New conversation |
+| Ctrl/Cmd + `+` / `-` / `0` | Zoom text in / out / reset |
+| Page Up / Page Down, or Alt + arrows | Scroll the conversation |
+| Ctrl/Cmd + Up / Down | Focus the previous / next tool entry |
+| Enter / Space on a tool | Expand or collapse details |
+| Mouse | Click controls and scroll with the wheel |
 
-To scaffold an example beside this checkout, run:
+Edit an imported source file and save: the CLI rebuilds it and the native runtime reloads. Reload clears in-memory state and shuts down the old app's subprocesses. The simulator starts at 3× scale; pass `-- --scale 2` for a smaller window.
 
-```sh
-node packages/cli/src/index.mjs init ../my-app
-```
+Other examples: `npm run dev` opens the dashboard; `npm run dev:catalog` opens the 10,000-item paged catalog. `npm run doctor` checks the local setup.
 
-The scaffold uses local packages from this checkout, so keep the checkout available while using it. See [Getting started](docs/getting-started.md) for setup details. Build an app bundle with `cpzero build` or `npm run build` from an initialized app.
-
-## Tiny example
+## Compose an app
 
 ```ts
-import { createApp, ui, signal, bind } from "@cpzero/core";
+import { createApp, ui, signal, bind } from '@cpzero/core';
 
-createApp({ title: "Counter", setup(root) {
+createApp({ setup(root) {
+  root.update({ padding: 6, gap: 4 });
   const count = signal(0);
-  const column = ui.column(root, { gap: 8, padding: 8 });
-  const value = ui.label(column, { text: "0" });
-  bind(value, "text", count);
-  ui.button(column, { text: "Add", onPress: () => count.value++ });
+  const card = ui.panel(root, { width: '100%', height: 80 });
+  const value = ui.text(card, { text: '0', fontSize: 20 });
+  bind(value, 'text', count);
+  ui.button(card, {
+    text: 'Add one', width: 90, height: 24,
+    onPress: () => count.value++,
+  });
 }});
 ```
 
+Use native pixel sizes, percentages, content sizing, or flex growth. Compact font sizes, wrapping, scrolling, focus, keyboard shortcuts, and widget-owned cleanup are built in. Change a widget directly or bind it to a small reactive signal—there is no virtual DOM.
+
+To create a separate project:
+
+```sh
+node packages/cli/src/index.mjs init ../my-app
+cd ../my-app
+npm install
+npm run dev
+```
+
+The scaffold links to this checkout. [Getting started →](docs/getting-started.md)
+
+## What you get
+
+- **Markdown:** bounded native rich text, headings, lists, code, quotes, emphasis and text zoom. [Markdown guide →](docs/markdown.md)
+- **Native UI:** rows, columns, panels, text, buttons, inputs, bars, scrolling and bounded paged lists.
+- **Themes:** semantic tokens, reusable component recipes and scoped live updates. [Theming →](docs/theming.md)
+- **Networking:** asynchronous HTTP(S), verified TLS, response limits, timeouts and cancellation.
+- **Processes:** argument-based spawning, streamed stdout/stderr, stdin, exit events and cleanup.
+- **Integrations:** typed TypeScript services and native C++ service extensions.
+- **Development:** bundle/watch CLI, native Mac/Linux simulator, screenshots, tests and a Linux ARM64 packaging helper.
+- **Codex adapter:** structured app-server protocol, streamed messages, turn cancellation and explicit request routing.
+
+Build tools use Node.js. Shipped app code runs in QuickJS; it does not have browser or Node APIs. HTTP and subprocess I/O run on a native worker. Codex is a separate executable with its own memory footprint. See the [resource limits and measurements](docs/performance.md).
+
 ## Documentation
 
-- [Getting started](docs/getting-started.md): install, run the example, and scaffold an app beside this checkout.
-- [Architecture](docs/architecture.md): how TypeScript, QuickJS, the native bridge, and LVGL fit together.
-- [API reference](docs/api.md): app lifecycle, widgets, signals, events, and timers.
-- [Services](docs/services.md): extend the app with platform and application capabilities.
-- [Performance](docs/performance.md): runtime behavior, resource limits, and practical guidance.
-- [Device packaging](docs/device.md): ARM64 Linux package helper and hardware verification status.
-- [Contributing](docs/contributing.md): repository layout and contributor workflow.
-- [Implementation contract](docs/implementation-contract.md): exact v0.1 implementation interfaces and host expectations.
-- [Third-party notices](docs/third-party.md): pinned dependencies and licenses.
-- [PocketJS research](docs/pocketjs-research.md): comparison and design lessons from a related QuickJS/native UI runtime.
+| Read | Learn |
+| --- | --- |
+| [Getting started](docs/getting-started.md) | Install, scaffold, preview and build |
+| [API reference](docs/api.md) | Widgets, sizing, state, events, shortcuts and timers |
+| [Components](docs/components.md) | Lazy disclosures and modal focus scopes |
+| [Markdown](docs/markdown.md) | Bounded parsing, native rich text and zoom |
+| [Theming](docs/theming.md) | Tokens, variants, scope and the shadcn-inspired approach |
+| [Recipes](docs/recipes.md) | Copyable compact app patterns |
+| [Services](docs/services.md) | HTTP, processes, storage and native integrations |
+| [Codex demo](docs/codex.md) | Run, customize and understand the CLI adapter |
+| [Architecture](docs/architecture.md) | Engine boundaries and current limits |
+| [Performance](docs/performance.md) | Budgets, complexity and measurements |
+| [Device packaging](docs/device.md) | Linux ARM64 builds and hardware validation status |
+| [Contributing](docs/contributing.md) | Develop and test the SDK |
+| [Agent guide](AGENTS.md) | Quick rules for AI coding agents |
+| [Third-party notices](docs/third-party.md) | Dependencies and licenses |
+| [PocketJS research](docs/pocketjs-research.md) | Related runtime design lessons |
 
-## Current scope
+## Current limits
 
-The host provides a small set of native LVGL widgets and a QuickJS JavaScript runtime. There is no JSX, Node.js API, browser DOM, or native network adapter in v0.1. Apps that need additional capabilities should provide a service adapter; widgets beyond the built-in set require native C++ work. The Debian packaging script requires a prebuilt Linux ARM64 host; its output and device behavior remain unverified. See [device support](docs/device.md) and [known limits](docs/architecture.md#current-limits).
+There is no React, DOM, CSS engine or direct shadcn/ui compatibility. The theme/component approach is native. Full CommonMark/HTML, arbitrary fonts, canvas drawing, audio and device-specific hardware adapters need further work. Additional native widgets and services can be added through the engine.
 
-The `@cpzero/core` package is the TypeScript SDK and `@cpzero/cli` provides the `cpzero` command. Build tooling runs under Node.js; app code runs inside QuickJS. A Debian packaging helper is included for an externally built ARM64 Linux host; see [Device packaging](docs/device.md). The repository does not yet establish that a packaged binary runs on the Cardputer Zero.
+The framebuffer backend compiles for Linux, but the packaging helper and actual Zero display/input integration still need device testing. CPZeroJS cannot guarantee every app fits the device's memory or compute budget; bound your data and measure the complete process tree.

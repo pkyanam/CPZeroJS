@@ -2,7 +2,7 @@
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 app_id="${1:-cpzero-demo}"
-app_version="${2:-0.1.0}"
+app_version="${2:-0.2.0}"
 host="${CPZERO_HOST:-$root/native/build/cpzero-host}"
 bundle="${CPZERO_BUNDLE:-$root/dist/app.js}"
 if [[ ! "$app_id" =~ ^[a-z][a-z0-9-]+$ ]] || [[ ! "$app_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -33,7 +33,7 @@ Package: $app_id
 Version: $app_version
 Architecture: arm64
 Maintainer: CPZeroJS developers
-Depends: libc6, libstdc++6, libgcc-s1
+Depends: libc6, libstdc++6, libgcc-s1, libcurl4
 Description: CPZeroJS native application for Cardputer Zero
 EOF
 cat > "$stage/usr/share/APPLaunch/applications/$app_id.desktop" <<EOF

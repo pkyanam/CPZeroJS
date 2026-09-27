@@ -1,5 +1,6 @@
 #include "quickjs.h"
 #include "services.hpp"
+#include "async_services.hpp"
 #include <lvgl.h>
 #ifdef CPZERO_FBDEV
 #include "fbdev.hpp"
@@ -15,10 +16,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -36,17 +39,29 @@ static constexpr int W = 320, H = 170;
 static constexpr size_t JS_LIMIT = 16U * 1024U * 1024U;
 static constexpr uint64_t JS_BUDGET_MS = 50;
 static constexpr int HOST_KEY_ENTER = 0x110001, HOST_KEY_TAB = 0x110002,
-                     HOST_KEY_ESCAPE = 0x110003;
+                     HOST_KEY_ESCAPE = 0x110003, HOST_KEY_SHIFTTAB = 0x110004,
+                     HOST_KEY_UP = 0x110005, HOST_KEY_DOWN = 0x110006,
+                     HOST_KEY_LEFT = 0x110007, HOST_KEY_RIGHT = 0x110008,
+                     HOST_KEY_PAGEUP = 0x110009, HOST_KEY_PAGEDOWN = 0x11000a,
+                     HOST_KEY_HOME = 0x11000b, HOST_KEY_END = 0x11000c,
+                     HOST_KEY_BACKSPACE = 0x11000d;
 struct Widget {
   uint32_t id;
   lv_obj_t *obj;
   std::string kind;
   uint32_t parent;
   std::unordered_set<uint32_t> children;
+  bool focusable = false;
+  bool explicitColor = false, explicitFont = false;
 };
+#ifndef CPZERO_FBDEV
+struct PointerSample { int x=0,y=0; bool pressed=false,edge=false; };
+#endif
+struct FocusScope { uint32_t container=0, previousFocus=0; lv_group_t *previousGroup=nullptr,*group=nullptr; std::vector<uint32_t> members; };
 struct Host {
   JSRuntime *rt = nullptr;
   JSContext *ctx = nullptr;
+  std::unique_ptr<cpzero::AsyncServices> async;
 #ifndef CPZERO_FBDEV
   SDL_Window *window = nullptr;
   SDL_Renderer *renderer = nullptr;
@@ -58,6 +73,7 @@ struct Host {
   lv_indev_t *mouse = nullptr;
   lv_indev_t *keyboard = nullptr;
   lv_group_t *group = nullptr;
+  std::vector<FocusScope> focusScopes;
   std::vector<uint32_t> pixels;
   std::unordered_map<uint32_t, Widget> widgets;
   uint32_t nextId = 1;
@@ -67,7 +83,29 @@ struct Host {
   int scale = 3, frames = -1, frame = 0;
   std::string screenshot;
   std::vector<int> keys;
-  size_t keyAt = 0;
+  uint32_t heldKey = 0;
+  bool heldKeyPressed = false;
+  std::string injectText;
+  bool textInjected = false;
+  std::string suppressedText;
+  uint32_t suppressTextUntil = 0;
+  bool screenshotRequested = false;
+#ifndef CPZERO_FBDEV
+  std::deque<SDL_Event> keyEvents;
+  std::deque<PointerSample> pointerEvents;
+  std::deque<SDL_Event> syntheticEvents;
+  int pointerX=0,pointerY=0;
+  bool pointerPressed=false;
+#endif
+  int clickX = -1, clickY = -1;
+  bool clickInjected = false;
+  bool keysBatch = false;
+#ifndef CPZERO_FBDEV
+  size_t keysInjected = 0;
+  bool keyReleasePending = false;
+  SDL_Keycode injectedKey = SDLK_UNKNOWN;
+  SDL_Keymod injectedMods = KMOD_NONE;
+#endif
   uint64_t lastTick = 0;
   Clock::time_point deadline{};
   Clock::time_point appStart = Clock::now();
@@ -77,6 +115,20 @@ struct Host {
   std::string error;
 };
 static Host *G = nullptr;
+LV_FONT_DECLARE(lv_font_cpzero_punct_8);
+LV_FONT_DECLARE(lv_font_cpzero_punct_10);
+LV_FONT_DECLARE(lv_font_cpzero_punct_12);
+LV_FONT_DECLARE(lv_font_cpzero_punct_14);
+LV_FONT_DECLARE(lv_font_cpzero_punct_16);
+LV_FONT_DECLARE(lv_font_cpzero_punct_20);
+static const lv_font_t *fontForSize(double n) {
+  if(n>=20) return &lv_font_cpzero_punct_20;
+  if(n>=16) return &lv_font_cpzero_punct_16;
+  if(n>=14) return &lv_font_cpzero_punct_14;
+  if(n>=12) return &lv_font_cpzero_punct_12;
+  if(n>=10) return &lv_font_cpzero_punct_10;
+  return &lv_font_cpzero_punct_8;
+}
 static uint64_t nowMs() {
   return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
              Clock::now().time_since_epoch())
@@ -198,12 +250,23 @@ static bool has(JSContext *c, JSValueConst o, const char *k) {
 static int32_t sizeProp(JSContext *c, JSValueConst p, int fallback) {
   if (JS_IsUndefined(p) || JS_IsNull(p))
     return fallback;
-  if (JS_IsString(p) && str(c, p) == "100%")
-    return LV_PCT(100);
+  if (JS_IsString(p)) {
+    std::string s=str(c,p);
+    if(s=="content") return LV_SIZE_CONTENT;
+    if(!s.empty()&&s.back()=='%') { char *end=nullptr; double n=std::strtod(s.c_str(),&end); if(end==s.c_str()+s.size()-1) return LV_PCT((int)std::clamp(n,0.0,100.0)); }
+  }
   double d = 0;
   if (!number(c, p, &d))
     return fallback;
   return (int32_t)std::clamp(d, 0.0, 4096.0);
+}
+static lv_flex_align_t alignProp(JSContext *c, JSValueConst p, lv_flex_align_t fallback) {
+  std::string s = str(c, p);
+  if (s == "center") return LV_FLEX_ALIGN_CENTER;
+  if (s == "end") return LV_FLEX_ALIGN_END;
+  if (s == "between") return LV_FLEX_ALIGN_SPACE_BETWEEN;
+  if (s == "start") return LV_FLEX_ALIGN_START;
+  return fallback;
 }
 static lv_color_t colorProp(JSContext *c, JSValueConst p, lv_color_t fallback) {
   if (!JS_IsString(p))
@@ -237,11 +300,26 @@ static lv_obj_t *makeObject(const std::string &kind, lv_obj_t *parent) {
   }
   if (kind == "input")
     return lv_textarea_create(parent);
+  if (kind == "richText") {
+    lv_obj_t *group=lv_spangroup_create(parent);
+    lv_spangroup_set_mode(group,LV_SPAN_MODE_BREAK);
+    lv_spangroup_set_overflow(group,LV_SPAN_OVERFLOW_CLIP);
+    lv_obj_set_width(group,LV_PCT(100));
+    return group;
+  }
   if (kind == "bar")
     return lv_bar_create(parent);
   if (kind == "box")
     return lv_obj_create(parent);
   return nullptr;
+}
+static void inheritTextStyles(Host *h,Widget &parent) {
+  for(uint32_t childId:parent.children) {
+    auto child=h->widgets.find(childId); if(child==h->widgets.end()) continue;
+    if(!child->second.explicitColor) lv_obj_set_style_text_color(textTarget(child->second),lv_obj_get_style_text_color(textTarget(parent),0),0);
+    if(!child->second.explicitFont) lv_obj_set_style_text_font(textTarget(child->second),lv_obj_get_style_text_font(textTarget(parent),0),0);
+    inheritTextStyles(h,child->second);
+  }
 }
 static void applyProps(Host *h, Widget &w, JSValueConst p) {
   lv_obj_t *o = w.obj;
@@ -254,6 +332,15 @@ static void applyProps(Host *h, Widget &w, JSValueConst p) {
   if (has(c, p, "height")) {
     JSValue v = prop(c, p, "height");
     lv_obj_set_height(o, sizeProp(c, v, LV_SIZE_CONTENT));
+    JS_FreeValue(c, v);
+  }
+  const char *dims[] = {"minWidth", "maxWidth", "minHeight", "maxHeight"};
+  for (int i = 0; i < 4; ++i) if (has(c, p, dims[i])) {
+    JSValue v = prop(c, p, dims[i]); int32_t n = sizeProp(c, v, 0);
+    if (i == 0) lv_obj_set_style_min_width(o, n, 0);
+    if (i == 1) lv_obj_set_style_max_width(o, n, 0);
+    if (i == 2) lv_obj_set_style_min_height(o, n, 0);
+    if (i == 3) lv_obj_set_style_max_height(o, n, 0);
     JS_FreeValue(c, v);
   }
   if (has(c, p, "hidden")) {
@@ -294,6 +381,15 @@ static void applyProps(Host *h, Widget &w, JSValueConst p) {
       lv_obj_set_style_pad_all(o, (int)n, 0);
     JS_FreeValue(c, v);
   }
+  const char *pads[] = {"paddingX", "paddingY"};
+  for (int i = 0; i < 2; ++i) if (has(c, p, pads[i])) {
+    JSValue v = prop(c, p, pads[i]); double n;
+    if (number(c, v, &n)) {
+      if (i == 0) { lv_obj_set_style_pad_left(o, (int)n, 0); lv_obj_set_style_pad_right(o, (int)n, 0); }
+      else { lv_obj_set_style_pad_top(o, (int)n, 0); lv_obj_set_style_pad_bottom(o, (int)n, 0); }
+    }
+    JS_FreeValue(c, v);
+  }
   if (has(c, p, "bg")) {
     JSValue v = prop(c, p, "bg");
     lv_obj_set_style_bg_color(o, colorProp(c, v, lv_color_white()), 0);
@@ -301,21 +397,28 @@ static void applyProps(Host *h, Widget &w, JSValueConst p) {
     JS_FreeValue(c, v);
   }
   if (has(c, p, "color")) {
+    w.explicitColor = true;
     JSValue v = prop(c, p, "color");
     lv_obj_set_style_text_color(textTarget(w),
                                 colorProp(c, v, lv_color_black()), 0);
     JS_FreeValue(c, v);
   }
+  if (has(c, p, "radius")) { JSValue v=prop(c,p,"radius"); double n; if(number(c,v,&n)) lv_obj_set_style_radius(o,(int)n,0); JS_FreeValue(c,v); }
+  if (has(c, p, "borderWidth")) { JSValue v=prop(c,p,"borderWidth"); double n; if(number(c,v,&n)) lv_obj_set_style_border_width(o,(int)n,0); JS_FreeValue(c,v); }
+  if (has(c, p, "borderColor")) { JSValue v=prop(c,p,"borderColor"); lv_obj_set_style_border_color(o,colorProp(c,v,lv_color_black()),0); JS_FreeValue(c,v); }
+  if (has(c, p, "opacity")) { JSValue v=prop(c,p,"opacity"); double n; if(number(c,v,&n)) lv_obj_set_style_opa(o,(lv_opa_t)std::clamp(n,0.0,255.0),0); JS_FreeValue(c,v); }
+  if (has(c, p, "textAlign")) { JSValue v=prop(c,p,"textAlign"); std::string s=str(c,v); lv_obj_set_style_text_align(textTarget(w),s=="center"?LV_TEXT_ALIGN_CENTER:s=="right"?LV_TEXT_ALIGN_RIGHT:LV_TEXT_ALIGN_LEFT,0); JS_FreeValue(c,v); }
+  if (has(c, p, "lineSpacing")) { JSValue v=prop(c,p,"lineSpacing"); double n; if(number(c,v,&n)) lv_obj_set_style_text_line_space(textTarget(w),(int)n,0); JS_FreeValue(c,v); }
   if (has(c, p, "fontSize")) {
+    w.explicitFont = true;
     JSValue v = prop(c, p, "fontSize");
     double n = 14;
     number(c, v, &n);
-    const lv_font_t *f = n >= 20   ? &lv_font_montserrat_20
-                         : n >= 16 ? &lv_font_montserrat_16
-                                   : &lv_font_montserrat_14;
+    const lv_font_t *f = fontForSize(n);
     lv_obj_set_style_text_font(textTarget(w), f, 0);
     JS_FreeValue(c, v);
   }
+  if(has(c,p,"focusColor")) { JSValue v=prop(c,p,"focusColor"); auto color=colorProp(c,v,lv_color_hex(0x8a8a8a)); lv_obj_set_style_outline_color(o,color,LV_STATE_FOCUSED); lv_obj_set_style_outline_color(o,color,LV_STATE_FOCUS_KEY); JS_FreeValue(c,v); }
   if (has(c, p, "text")) {
     JSValue v = prop(c, p, "text");
     std::string s = str(c, v);
@@ -332,10 +435,40 @@ static void applyProps(Host *h, Widget &w, JSValueConst p) {
       lv_textarea_set_text(o, s.c_str());
     JS_FreeValue(c, v);
   }
+  if(w.kind=="richText" && has(c,p,"spans")) {
+    JSValue list=prop(c,p,"spans"), lenV=prop(c,list,"length"); uint32_t len=0; JS_ToUint32(c,&len,lenV); JS_FreeValue(c,lenV);
+    while(lv_spangroup_get_span_count(o)) lv_spangroup_delete_span(o,lv_spangroup_get_child(o,-1));
+    for(uint32_t i=0;i<std::min<uint32_t>(len,256);++i) {
+      JSValue item=JS_GetPropertyUint32(c,list,i), text=prop(c,item,"text");
+      lv_span_t *span=lv_spangroup_new_span(o); lv_span_set_text(span,str(c,text).c_str()); JS_FreeValue(c,text);
+      lv_style_t *style=lv_span_get_style(span);
+      if(has(c,item,"color")) { JSValue v=prop(c,item,"color"); lv_style_set_text_color(style,colorProp(c,v,lv_color_black())); JS_FreeValue(c,v); }
+      if(has(c,item,"fontSize")) { JSValue v=prop(c,item,"fontSize"); double n=12; number(c,v,&n); lv_style_set_text_font(style,fontForSize(n)); JS_FreeValue(c,v); }
+      JS_FreeValue(c,item);
+    }
+    JS_FreeValue(c,list);
+    if(has(c,p,"textAlign")) { JSValue v=prop(c,p,"textAlign"); std::string s=str(c,v); lv_spangroup_set_align(o,s=="center"?LV_TEXT_ALIGN_CENTER:s=="right"?LV_TEXT_ALIGN_RIGHT:LV_TEXT_ALIGN_LEFT); JS_FreeValue(c,v); }
+  }
+  if (w.kind == "label") {
+    if (has(c,p,"overflow")) { JSValue v=prop(c,p,"overflow"); std::string s=str(c,v); lv_label_set_long_mode(o,s=="ellipsis"?LV_LABEL_LONG_DOT:s=="clip"?LV_LABEL_LONG_CLIP:LV_LABEL_LONG_WRAP); JS_FreeValue(c,v); }
+  }
+  if (w.kind == "input") {
+    { JSValue v=prop(c,p,"multiline"); lv_textarea_set_one_line(o,!JS_ToBool(c,v)); JS_FreeValue(c,v); }
+    if (has(c,p,"maxLength")) { JSValue v=prop(c,p,"maxLength"); int32_t n=0; if(JS_ToInt32(c,&n,v)==0) lv_textarea_set_max_length(o,(uint32_t)std::max(0,n)); JS_FreeValue(c,v); }
+    if (has(c,p,"placeholder")) { JSValue v=prop(c,p,"placeholder"); std::string s=str(c,v); lv_textarea_set_placeholder_text(o,s.c_str()); JS_FreeValue(c,v); }
+  }
+  if (has(c,p,"scroll")) { JSValue v=prop(c,p,"scroll"); std::string s=str(c,v); lv_obj_set_scroll_dir(o,s=="none"?LV_DIR_NONE:s=="vertical"?LV_DIR_VER:s=="horizontal"?LV_DIR_HOR:LV_DIR_ALL); JS_FreeValue(c,v); }
+  if (has(c,p,"focusable")) { JSValue v=prop(c,p,"focusable"); if(JS_ToBool(c,v)) { lv_obj_add_flag(o,LV_OBJ_FLAG_CLICK_FOCUSABLE); } else if(w.kind!="button"&&w.kind!="input") lv_obj_clear_flag(o,LV_OBJ_FLAG_CLICK_FOCUSABLE); JS_FreeValue(c,v); }
   if (w.kind == "column" || w.kind == "screen")
     lv_obj_set_flex_flow(o, LV_FLEX_FLOW_COLUMN);
   else if (w.kind == "row")
     lv_obj_set_flex_flow(o, LV_FLEX_FLOW_ROW);
+  if (w.kind == "column" || w.kind == "row" || w.kind == "screen") {
+    lv_flex_align_t main=LV_FLEX_ALIGN_START,cross=LV_FLEX_ALIGN_START;
+    if (has(c,p,"align")) { JSValue v=prop(c,p,"align"); cross=alignProp(c,v,LV_FLEX_ALIGN_START); JS_FreeValue(c,v); }
+    if (has(c,p,"justify")) { JSValue v=prop(c,p,"justify"); main=alignProp(c,v,LV_FLEX_ALIGN_START); JS_FreeValue(c,v); }
+    lv_obj_set_flex_align(o,main,cross,LV_FLEX_ALIGN_START);
+  }
   if (w.kind == "bar") {
     int32_t mn = lv_bar_get_min_value(o), mx = lv_bar_get_max_value(o);
     if (has(c, p, "min")) {
@@ -362,6 +495,7 @@ static void applyProps(Host *h, Widget &w, JSValueConst p) {
       JS_FreeValue(c, q);
     }
   }
+  inheritTextStyles(h,w);
 }
 static void dispatch(Host *h, uint32_t id, const char *event,
                      const char *value) {
@@ -392,6 +526,62 @@ static void onLvEvent(lv_event_t *e) {
     dispatch(h, id, "press", "");
   else if (code == LV_EVENT_VALUE_CHANGED && w.kind == "input")
     dispatch(h, id, "change", lv_textarea_get_text(w.obj));
+  else if (code == LV_EVENT_READY && w.kind == "input")
+    dispatch(h, id, "submit", lv_textarea_get_text(w.obj));
+  else if (code == LV_EVENT_FOCUSED) dispatch(h,id,"focus","");
+  else if (code == LV_EVENT_DEFOCUSED) dispatch(h,id,"blur","");
+  else if (code == LV_EVENT_SCROLL) dispatch(h,id,"scroll","");
+}
+static bool validSpanProps(JSContext *c, JSValueConst p) {
+  if(!has(c,p,"spans")) return true;
+  JSValue list=prop(c,p,"spans");
+  if(!JS_IsArray(list)) { JS_FreeValue(c,list); JS_ThrowTypeError(c,"richText spans must be an array"); return false; }
+  JSValue lenV=prop(c,list,"length"); uint32_t len=0; JS_ToUint32(c,&len,lenV);
+  JS_FreeValue(c,lenV); JS_FreeValue(c,list);
+  if(len>256) { JS_ThrowRangeError(c,"richText supports at most 256 spans"); return false; }
+  return true;
+}
+static bool insideWidgetTree(Host *h,uint32_t id,uint32_t ancestor) {
+  for(uint32_t at=id;at;){ if(at==ancestor) return true; auto it=h->widgets.find(at); if(it==h->widgets.end()) break; at=it->second.parent; }
+  return ancestor==0;
+}
+static bool visibleWidget(Host *h,uint32_t id) {
+  for(uint32_t at=id;at;){ auto it=h->widgets.find(at); if(it==h->widgets.end()) return false; if(lv_obj_has_flag(it->second.obj,LV_OBJ_FLAG_HIDDEN)) return false; at=it->second.parent; }
+  return true;
+}
+static lv_group_t *groupForWidget(Host *h,uint32_t id) {
+  for(auto it=h->focusScopes.rbegin();it!=h->focusScopes.rend();++it) if(insideWidgetTree(h,id,it->container)) return it->group;
+  return h->focusScopes.empty()?h->group:h->focusScopes.front().previousGroup;
+}
+static bool beginFocusScope(Host *h,uint32_t container,uint32_t initial) {
+  auto root=h->widgets.find(container); if(root==h->widgets.end()) return false;
+  if(h->focusScopes.size()>=16) return false;
+  FocusScope scope; scope.container=container; scope.previousGroup=h->group;
+  lv_obj_t *focused=lv_group_get_focused(h->group);
+  for(const auto &entry:h->widgets) if(focused==entry.second.obj) { scope.previousFocus=entry.first; break; }
+  for(auto &entry:h->widgets) if(entry.second.focusable&&visibleWidget(h,entry.first)&&insideWidgetTree(h,entry.first,container)) {
+    scope.members.push_back(entry.first);
+  }
+  std::sort(scope.members.begin(),scope.members.end());
+  if(scope.members.empty()) return false;
+  bool initialFound=false; for(uint32_t member:scope.members) if(member==initial) initialFound=true;
+  if(initial && !initialFound) return false;
+  scope.group=lv_group_create(); if(!scope.group) return false;
+  for(uint32_t member:scope.members) { auto &obj=h->widgets.at(member).obj; if(lv_obj_get_group(obj)) lv_group_remove_obj(obj); lv_group_add_obj(scope.group,obj); }
+  h->focusScopes.push_back(std::move(scope)); h->group=h->focusScopes.back().group;
+  lv_group_set_default(h->group); lv_indev_set_group(h->keyboard,h->group);
+  uint32_t focusId=initial?initial:h->focusScopes.back().members.front();
+  auto fit=h->widgets.find(focusId); if(fit!=h->widgets.end()) lv_group_focus_obj(fit->second.obj);
+  return true;
+}
+static bool endFocusScope(Host *h,uint32_t container) {
+  if(h->focusScopes.empty() || (container && h->focusScopes.back().container!=container)) return false;
+  FocusScope scope=std::move(h->focusScopes.back()); h->focusScopes.pop_back();
+  for(uint32_t member:scope.members) { auto it=h->widgets.find(member); if(it==h->widgets.end()) continue; if(lv_obj_get_group(it->second.obj)) lv_group_remove_obj(it->second.obj); lv_group_add_obj(scope.previousGroup,it->second.obj); }
+  h->group=scope.previousGroup; lv_group_set_default(h->group); lv_indev_set_group(h->keyboard,h->group);
+  auto focus=h->widgets.find(scope.previousFocus); if(focus!=h->widgets.end()&&visibleWidget(h,scope.previousFocus)) lv_group_focus_obj(focus->second.obj);
+  lv_group_delete(scope.group);
+  return true;
 }
 static JSValue cpCreate(JSContext *c, JSValueConst, int argc,
                         JSValueConst *argv) {
@@ -399,6 +589,7 @@ static JSValue cpCreate(JSContext *c, JSValueConst, int argc,
   if (argc < 3 || !JS_IsNumber(argv[1]))
     return JS_ThrowTypeError(c, "create(kind,parent,props) expected");
   std::string kind = str(c, argv[0]);
+  if(kind=="richText"&&!validSpanProps(c,argv[2])) return JS_EXCEPTION;
   int32_t parent = 0;
   JS_ToInt32(c, &parent, argv[1]);
   lv_obj_t *par = h->screen;
@@ -411,6 +602,7 @@ static JSValue cpCreate(JSContext *c, JSValueConst, int argc,
   lv_obj_t *obj = makeObject(kind, par);
   if (!obj)
     return JS_ThrowTypeError(c, "unsupported widget kind: %s", kind.c_str());
+  lv_obj_set_scroll_dir(obj,LV_DIR_NONE);
   uint32_t id = h->nextId++;
   if (h->widgets.size() >= 10000) {
     lv_obj_delete(obj);
@@ -427,19 +619,36 @@ static JSValue cpCreate(JSContext *c, JSValueConst, int argc,
     lv_obj_set_style_border_width(obj, 0, 0);
     lv_obj_set_style_radius(obj, 0, 0);
     lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_all(obj,0,0);
   }
+  if(kind=="button") { lv_obj_set_style_pad_top(obj,3,0); lv_obj_set_style_pad_bottom(obj,3,0); lv_obj_set_style_pad_left(obj,6,0); lv_obj_set_style_pad_right(obj,6,0); lv_obj_set_style_radius(obj,3,0); }
+  if(kind=="input") { lv_obj_set_style_pad_top(obj,3,0); lv_obj_set_style_pad_bottom(obj,3,0); lv_obj_set_style_pad_left(obj,4,0); lv_obj_set_style_pad_right(obj,4,0); }
+  if(kind=="button"||kind=="input") { for(lv_state_t state:{(lv_state_t)LV_STATE_FOCUSED,(lv_state_t)LV_STATE_FOCUS_KEY}) { lv_obj_set_style_outline_width(obj,1,state); lv_obj_set_style_outline_color(obj,lv_color_hex(0x8a8a8a),state); lv_obj_set_style_outline_pad(obj,-2,state); } }
   Widget w{id, obj, kind, (uint32_t)parent, {}};
+  lv_obj_add_event_cb(obj,onLvEvent,LV_EVENT_SCROLL,(void *)(uintptr_t)id);
   if (parent)
     h->widgets.at(parent).children.insert(id);
   h->widgets.emplace(id, std::move(w));
+  if(parent) {
+    auto &child=h->widgets.at(id); auto &pw=h->widgets.at(parent);
+    lv_obj_set_style_text_color(textTarget(child),lv_obj_get_style_text_color(textTarget(pw),0),0);
+    lv_obj_set_style_text_font(textTarget(child),lv_obj_get_style_text_font(textTarget(pw),0),0);
+  }
   applyProps(h, h->widgets.at(id), argv[2]);
+  bool focusable=kind=="button"||kind=="input";
+  if(has(h->ctx,argv[2],"focusable")) { JSValue v=prop(h->ctx,argv[2],"focusable"); focusable=JS_ToBool(h->ctx,v); JS_FreeValue(h->ctx,v); }
   if (kind == "button" || kind == "input") {
-    lv_obj_add_event_cb(obj, onLvEvent,
-                        kind == "button" ? LV_EVENT_CLICKED
-                                         : LV_EVENT_VALUE_CHANGED,
-                        (void *)(uintptr_t)id);
-    lv_group_add_obj(h->group, obj);
-    if (!lv_group_get_focused(h->group))
+    lv_obj_add_event_cb(obj, onLvEvent, kind == "button" ? LV_EVENT_CLICKED : LV_EVENT_VALUE_CHANGED, (void *)(uintptr_t)id);
+    if(kind=="input") lv_obj_add_event_cb(obj,onLvEvent,LV_EVENT_READY,(void *)(uintptr_t)id);
+  }
+  if(focusable) {
+    h->widgets.at(id).focusable=true;
+    lv_obj_add_flag(obj,LV_OBJ_FLAG_CLICK_FOCUSABLE);
+    lv_obj_add_event_cb(obj,onLvEvent,LV_EVENT_FOCUSED,(void *)(uintptr_t)id);
+    lv_obj_add_event_cb(obj,onLvEvent,LV_EVENT_DEFOCUSED,(void *)(uintptr_t)id);
+    lv_group_t *targetGroup=groupForWidget(h,id);
+    lv_group_add_obj(targetGroup, obj);
+    if (!lv_group_get_focused(targetGroup))
       lv_group_focus_obj(obj);
   }
   return JS_NewInt32(c, (int)id);
@@ -453,7 +662,31 @@ static JSValue cpUpdate(JSContext *c, JSValueConst, int argc,
   auto it = h->widgets.find(id);
   if (it == h->widgets.end())
     return JS_ThrowReferenceError(c, "widget %d is disposed", id);
+  if(it->second.kind=="richText"&&!validSpanProps(c,argv[1])) return JS_EXCEPTION;
   applyProps(h, it->second, argv[1]);
+  if(has(c,argv[1],"focusable")) {
+    JSValue v=prop(c,argv[1],"focusable"); bool focusable=JS_ToBool(c,v); JS_FreeValue(c,v);
+    auto *o=it->second.obj;
+    if(!focusable) { if(lv_obj_get_group(o)) lv_group_remove_obj(o); it->second.focusable=false; }
+    else { it->second.focusable=true; if(visibleWidget(h,(uint32_t)id)&&!lv_obj_get_group(o)) { lv_group_add_obj(groupForWidget(h,(uint32_t)id),o); lv_obj_add_flag(o,LV_OBJ_FLAG_CLICK_FOCUSABLE); } }
+  } else if(it->second.focusable&&!lv_obj_get_group(it->second.obj)&&visibleWidget(h,(uint32_t)id)) lv_group_add_obj(groupForWidget(h,(uint32_t)id),it->second.obj);
+  return JS_UNDEFINED;
+}
+static JSValue cpCommand(JSContext *c, JSValueConst, int argc, JSValueConst *argv) {
+  int32_t id=0; if (argc < 2 || JS_ToInt32(c,&id,argv[0])<0) return JS_ThrowTypeError(c,"command(id,action,arg?) expected");
+  auto it=G->widgets.find((uint32_t)id); if(it==G->widgets.end()) return JS_ThrowReferenceError(c,"widget %d is disposed",id);
+  Widget &w=it->second; std::string action=str(c,argv[1]);
+  if(action=="focus") { if(lv_obj_get_group(w.obj)==G->group) { lv_group_focus_obj(w.obj); lv_obj_scroll_to_view(w.obj,LV_ANIM_OFF); } return JS_UNDEFINED; }
+  if(action=="isFocused") return JS_NewBool(c,lv_obj_get_group(w.obj)==G->group&&lv_group_get_focused(G->group)==w.obj);
+  if(action=="trapFocus") { uint32_t initial=0; if(argc>2) JS_ToUint32(c,&initial,argv[2]); if(!beginFocusScope(G,(uint32_t)id,initial)) return JS_ThrowTypeError(c,"focus scope needs visible focusable descendants and a valid initial widget"); return JS_UNDEFINED; }
+  if(action=="releaseFocus") { if(!endFocusScope(G,(uint32_t)id)) return JS_ThrowTypeError(c,"focus scopes must be released in nesting order"); return JS_UNDEFINED; }
+  if(action=="getValue") return JS_NewString(c,w.kind=="input"?lv_textarea_get_text(w.obj):"");
+  if(action=="getScrollY") return JS_NewInt32(c,lv_obj_get_scroll_y(w.obj));
+  int32_t n=0; if(argc>2) JS_ToInt32(c,&n,argv[2]);
+  if(action=="scrollTo") lv_obj_scroll_to_y(w.obj,n,LV_ANIM_OFF);
+  else if(action=="scrollBy") lv_obj_scroll_by(w.obj,0,n,LV_ANIM_OFF);
+  else if(action=="scrollToEnd") lv_obj_scroll_to_y(w.obj,LV_COORD_MAX,LV_ANIM_OFF);
+  else return JS_ThrowTypeError(c,"unknown widget command '%s'",action.c_str());
   return JS_UNDEFINED;
 }
 static void eraseTree(Host *h, uint32_t id) {
@@ -463,6 +696,7 @@ static void eraseTree(Host *h, uint32_t id) {
   auto kids = it->second.children;
   for (uint32_t child : kids)
     eraseTree(h, child);
+  for(auto &scope:h->focusScopes) scope.members.erase(std::remove(scope.members.begin(),scope.members.end(),id),scope.members.end());
   uint32_t par = it->second.parent;
   if (par) {
     auto p = h->widgets.find(par);
@@ -479,6 +713,7 @@ static JSValue cpRemove(JSContext *c, JSValueConst, int argc,
     return JS_ThrowTypeError(c, "remove(id) expected");
   auto it = G->widgets.find(id);
   if (it != G->widgets.end()) {
+    while(!G->focusScopes.empty()&&insideWidgetTree(G,G->focusScopes.back().container,(uint32_t)id)) endFocusScope(G,0);
     lv_obj_delete(it->second.obj);
     eraseTree(G, (uint32_t)id);
   }
@@ -513,6 +748,15 @@ static JSValue cpInvoke(JSContext *c, JSValueConst, int argc,
     return JS_ThrowTypeError(c, "invoke(service,method,jsonArgs) expected");
   std::string service = str(c, argv[0]), method = str(c, argv[1]),
               json = str(c, argv[2]);
+  if (G->async && G->async->handles(service))
+    return G->async->invoke(c, service, method, json);
+  if(service=="platform" && method=="get") {
+    const char *bin=std::getenv("CPZERO_CODEX_BIN"); const char *cwd=std::getenv("CPZERO_CODEX_CWD");
+    std::string wd=cwd&&*cwd?cwd:fs::current_path().string();
+    std::string command=bin&&*bin?bin:"codex";
+    auto quote=[](const std::string &s){std::string out="\""; for(char ch:s){if(ch=='\\'||ch=='\"')out.push_back('\\'); if(ch=='\n')out+="\\n"; else out.push_back(ch);} return out+"\"";};
+    return JS_NewString(c,("{\"cwd\":"+quote(wd)+",\"codexCommand\":"+quote(command)+"}").c_str());
+  }
   if (service != "storage") {
     const auto *handler = cpzero::findService(service);
     if (!handler)
@@ -618,9 +862,9 @@ static void flush(lv_display_t *d, const lv_area_t *a, uint8_t *p) {
     std::copy(src, src + (x2 - x1 + 1), h->pixels.begin() + (size_t)y * W + x1);
   }
 #ifdef CPZERO_FBDEV
-  h->framebuffer.present(h->pixels.data());
+  if(lv_display_flush_is_last(d)) h->framebuffer.present(h->pixels.data());
 #else
-  if (h->texture) {
+  if (h->texture && lv_display_flush_is_last(d)) {
     SDL_UpdateTexture(h->texture, nullptr, h->pixels.data(),
                       W * sizeof(uint32_t));
     SDL_RenderClear(h->renderer);
@@ -630,22 +874,146 @@ static void flush(lv_display_t *d, const lv_area_t *a, uint8_t *p) {
 #endif
   lv_display_flush_ready(d);
 }
+static bool cpKeyConsumed(const std::string &key, bool ctrl, bool shift, bool alt, bool meta) {
+  JSValue global=JS_GetGlobalObject(G->ctx), fn=JS_GetPropertyStr(G->ctx,global,"__cpKey"); JS_FreeValue(G->ctx,global);
+  if(!JS_IsFunction(G->ctx,fn)) { JS_FreeValue(G->ctx,fn); return false; }
+  JSValue m=JS_NewObject(G->ctx);
+  JS_SetPropertyStr(G->ctx,m,"ctrl",JS_NewBool(G->ctx,ctrl)); JS_SetPropertyStr(G->ctx,m,"shift",JS_NewBool(G->ctx,shift));
+  JS_SetPropertyStr(G->ctx,m,"alt",JS_NewBool(G->ctx,alt)); JS_SetPropertyStr(G->ctx,m,"meta",JS_NewBool(G->ctx,meta));
+  JSValue a[2]={JS_NewString(G->ctx,key.c_str()),m};
+  G->deadline=Clock::now()+std::chrono::milliseconds(JS_BUDGET_MS); G->deadlineActive=true;
+  JSValue r=JS_Call(G->ctx,fn,JS_UNDEFINED,2,a); bool ok=check(G->ctx,r,"__cpKey");
+  bool consumed=ok&&JS_ToBool(G->ctx,r); JS_FreeValue(G->ctx,r);
+  ok=drainJobs(G,"__cpKey"); G->deadlineActive=false; if(!ok) G->running=false;
+  JS_FreeValue(G->ctx,a[0]); JS_FreeValue(G->ctx,a[1]); JS_FreeValue(G->ctx,fn); return consumed;
+}
 #ifndef CPZERO_FBDEV
 static void pointerRead(lv_indev_t *, lv_indev_data_t *d) {
-  int x = 0, y = 0;
-  uint32_t b = SDL_GetMouseState(&x, &y);
-  d->point.x = x / G->scale;
-  d->point.y = y / G->scale;
-  d->state =
-      (b & SDL_BUTTON_LMASK) ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+  if(!G->pointerEvents.empty()) {
+    PointerSample sample=G->pointerEvents.front(); G->pointerEvents.pop_front();
+    G->pointerX=sample.x; G->pointerY=sample.y; G->pointerPressed=sample.pressed;
+  }
+  d->point.x=G->pointerX; d->point.y=G->pointerY;
+  d->state=G->pointerPressed?LV_INDEV_STATE_PRESSED:LV_INDEV_STATE_RELEASED;
+  d->continue_reading=!G->pointerEvents.empty();
 }
-static uint32_t mapKey(SDL_Keycode k) {
+static void flushPointerEvents(Host *h) {
+  if(h->mouse && !h->pointerEvents.empty()) lv_indev_read(h->mouse);
+}
+static std::string keyName(SDL_Keycode k) {
+  switch(k) { case SDLK_RETURN: case SDLK_KP_ENTER:return "Enter"; case SDLK_ESCAPE:return "Escape"; case SDLK_TAB:return "Tab"; case SDLK_UP:return "ArrowUp"; case SDLK_DOWN:return "ArrowDown"; case SDLK_LEFT:return "ArrowLeft"; case SDLK_RIGHT:return "ArrowRight"; case SDLK_PAGEUP:return "PageUp"; case SDLK_PAGEDOWN:return "PageDown"; case SDLK_HOME:return "Home"; case SDLK_END:return "End"; default: return k>=32&&k<127?std::string(1,(char)std::tolower((unsigned char)k)):SDL_GetKeyName(k); }
+}
+static bool shortcutConsumed(SDL_Keycode k, SDL_Keymod mods) {
+  return cpKeyConsumed(keyName(k),(mods&KMOD_CTRL)!=0,(mods&KMOD_SHIFT)!=0,(mods&KMOD_ALT)!=0,(mods&KMOD_GUI)!=0);
+}
+static lv_point_t logicalPoint(Host *,int x,int y) {
+  // SDL_RenderSetLogicalSize filters mouse events into logical coordinates.
+  return {(lv_coord_t)x,(lv_coord_t)y};
+}
+static void enqueuePointer(Host *h,int x,int y,bool pressed,bool edge) {
+  lv_point_t p=logicalPoint(h,x,y);
+  constexpr size_t LIMIT=2048;
+  if(h->pointerEvents.size()>=LIMIT) {
+    if(!edge) {
+      auto it=std::find_if(h->pointerEvents.rbegin(),h->pointerEvents.rend(),[](const PointerSample &s){return !s.edge;});
+      if(it!=h->pointerEvents.rend()) { *it={p.x,p.y,pressed,false}; return; }
+      return;
+    }
+    auto it=std::find_if(h->pointerEvents.begin(),h->pointerEvents.end(),[](const PointerSample &s){return !s.edge;});
+    if(it!=h->pointerEvents.end()) h->pointerEvents.erase(it);
+    else { std::cerr<<"SDL pointer input queue full; dropping pointer edge\n"; return; }
+  }
+  h->pointerEvents.push_back({p.x,p.y,pressed,edge});
+}
+static void routeSdlEvent(Host *h,const SDL_Event &e) {
+  if(e.type==SDL_QUIT) { h->running=false; return; }
+  if(e.type==SDL_WINDOWEVENT && e.window.event==SDL_WINDOWEVENT_FOCUS_LOST) {
+    h->keyEvents.clear(); h->heldKey=0; h->heldKeyPressed=false;
+    if(h->pointerPressed) enqueuePointer(h,h->pointerX*h->scale,h->pointerY*h->scale,false,true);
+    return;
+  }
+  if(e.type==SDL_MOUSEMOTION) { enqueuePointer(h,e.motion.x,e.motion.y,(e.motion.state&SDL_BUTTON_LMASK)!=0,false); return; }
+  if(e.type==SDL_MOUSEBUTTONDOWN||e.type==SDL_MOUSEBUTTONUP) {
+    if(e.button.button==SDL_BUTTON_LEFT) enqueuePointer(h,e.button.x,e.button.y,e.type==SDL_MOUSEBUTTONDOWN,true);
+    return;
+  }
+  if(e.type==SDL_MOUSEWHEEL) {
+    lv_point_t p=logicalPoint(h,e.wheel.mouseX,e.wheel.mouseY); lv_obj_t *best=nullptr; int bestArea=std::numeric_limits<int>::max();
+    for(auto &entry:h->widgets) { auto *o=entry.second.obj; lv_dir_t dir=lv_obj_get_scroll_dir(o); if(!(dir&LV_DIR_VER)||!lv_obj_hit_test(o,&p)) continue; lv_area_t a; lv_obj_get_coords(o,&a); int area=(a.x2-a.x1+1)*(a.y2-a.y1+1); if(area<bestArea){best=o;bestArea=area;} }
+    if(best) { int delta=e.wheel.y*24; if(e.wheel.direction!=SDL_MOUSEWHEEL_FLIPPED) delta=-delta; lv_obj_scroll_by(best,0,delta,LV_ANIM_OFF); }
+    return;
+  }
+  if(e.type==SDL_KEYDOWN&&e.key.keysym.sym==SDLK_F12&&!h->screenshot.empty()) { h->screenshotRequested=true; return; }
+  if(e.type==SDL_KEYDOWN||e.type==SDL_KEYUP||e.type==SDL_TEXTINPUT) {
+    flushPointerEvents(h);
+    if(h->keyEvents.size()<1024) h->keyEvents.push_back(e);
+    else std::cerr<<"SDL keyboard input queue full; dropping input event\n";
+  }
+}
+static void pollSdlEvents(Host *h) {
+  SDL_Event e; bool injectedText=false;
+  while(SDL_PollEvent(&e)) {
+    if(!injectedText && (e.type==SDL_KEYDOWN||e.type==SDL_KEYUP||e.type==SDL_TEXTINPUT)) {
+      while(!h->syntheticEvents.empty()) { SDL_Event pending=h->syntheticEvents.front(); h->syntheticEvents.pop_front(); routeSdlEvent(h,pending); }
+      injectedText=true;
+    }
+    routeSdlEvent(h,e);
+  }
+  while(!h->syntheticEvents.empty()) { e=h->syntheticEvents.front(); h->syntheticEvents.pop_front(); routeSdlEvent(h,e); }
+}
+static void pushText(Host *h, const std::string &text) {
+  for(size_t i=0;i<text.size();) {
+    SDL_Event e{}; e.type=SDL_TEXTINPUT;
+    size_t n=std::min<size_t>(sizeof(e.text.text)-1,text.size()-i);
+    while(n && i+n<text.size() && (static_cast<unsigned char>(text[i+n])&0xc0)==0x80) --n;
+    if(!n) n=std::min<size_t>(sizeof(e.text.text)-1,text.size()-i);
+    std::memcpy(e.text.text,text.data()+i,n); e.text.text[n]='\0';
+    h->syntheticEvents.push_back(e);
+    i+=n;
+  }
+}
+static void pushClick(Host *h) {
+  if(h->clickInjected || h->clickX<0 || !h->window) return;
+  const int x=h->clickX*h->scale,y=h->clickY*h->scale;
+  SDL_Event down{}; down.type=SDL_MOUSEBUTTONDOWN; down.button.button=SDL_BUTTON_LEFT; down.button.state=SDL_PRESSED; down.button.x=x; down.button.y=y; down.button.windowID=SDL_GetWindowID(h->window);
+  SDL_Event up=down; up.type=SDL_MOUSEBUTTONUP; up.button.state=SDL_RELEASED;
+  for(int i=0;i<2;++i) if(SDL_PushEvent(&down)<0 || SDL_PushEvent(&up)<0) std::cerr<<"SDL click injection failed: "<<SDL_GetError()<<"\n";
+  h->clickInjected=true;
+}
+static void pushKeys(Host *h) {
+  if(h->keysBatch) {
+    if(h->keysInjected) return;
+    for(int raw:h->keys) {
+      SDL_Keycode k=raw==HOST_KEY_ENTER?SDLK_RETURN:raw==HOST_KEY_TAB||raw==HOST_KEY_SHIFTTAB?SDLK_TAB:raw==HOST_KEY_ESCAPE?SDLK_ESCAPE:raw==HOST_KEY_UP?SDLK_UP:raw==HOST_KEY_DOWN?SDLK_DOWN:raw==HOST_KEY_LEFT?SDLK_LEFT:raw==HOST_KEY_RIGHT?SDLK_RIGHT:raw==HOST_KEY_PAGEUP?SDLK_PAGEUP:raw==HOST_KEY_PAGEDOWN?SDLK_PAGEDOWN:raw==HOST_KEY_HOME?SDLK_HOME:raw==HOST_KEY_END?SDLK_END:raw==HOST_KEY_BACKSPACE?SDLK_BACKSPACE:(SDL_Keycode)raw;
+      for(bool down:{true,false}) { SDL_Event e{}; e.type=down?SDL_KEYDOWN:SDL_KEYUP; e.key.state=down?SDL_PRESSED:SDL_RELEASED; e.key.keysym.sym=k; e.key.keysym.mod=raw==HOST_KEY_SHIFTTAB?KMOD_SHIFT:KMOD_NONE; if(SDL_PushEvent(&e)<0) std::cerr<<"SDL key injection failed: "<<SDL_GetError()<<"\n"; }
+    }
+    h->keysInjected=1; return;
+  }
+  bool down=false;
+  if(h->keyReleasePending) { h->keyReleasePending=false; }
+  else {
+    if(h->keysInjected>=h->keys.size()) return;
+    int raw=h->keys[h->keysInjected++];
+    h->injectedKey=raw==HOST_KEY_ENTER?SDLK_RETURN:raw==HOST_KEY_TAB||raw==HOST_KEY_SHIFTTAB?SDLK_TAB:raw==HOST_KEY_ESCAPE?SDLK_ESCAPE:raw==HOST_KEY_UP?SDLK_UP:raw==HOST_KEY_DOWN?SDLK_DOWN:raw==HOST_KEY_LEFT?SDLK_LEFT:raw==HOST_KEY_RIGHT?SDLK_RIGHT:raw==HOST_KEY_PAGEUP?SDLK_PAGEUP:raw==HOST_KEY_PAGEDOWN?SDLK_PAGEDOWN:raw==HOST_KEY_HOME?SDLK_HOME:raw==HOST_KEY_END?SDLK_END:raw==HOST_KEY_BACKSPACE?SDLK_BACKSPACE:(SDL_Keycode)raw;
+    h->injectedMods=raw==HOST_KEY_SHIFTTAB?KMOD_SHIFT:KMOD_NONE; h->keyReleasePending=true; down=true;
+  }
+  SDL_Event e{}; e.type=down?SDL_KEYDOWN:SDL_KEYUP; e.key.state=down?SDL_PRESSED:SDL_RELEASED; e.key.repeat=0; e.key.keysym.sym=h->injectedKey; e.key.keysym.mod=h->injectedMods;
+  if(SDL_PushEvent(&e)<0) std::cerr<<"SDL key injection failed: "<<SDL_GetError()<<"\n";
+}
+static void textInput(const char *s) {
+  if(!G->suppressedText.empty() && SDL_GetTicks()<=G->suppressTextUntil && G->suppressedText==s) { G->suppressedText.clear(); return; }
+  G->suppressedText.clear();
+  lv_obj_t *focused=lv_group_get_focused(G->group); if(!focused) return;
+  auto *ta=lv_obj_check_type(focused,&lv_textarea_class)?focused:nullptr;
+  if(ta) lv_textarea_add_text(ta,s);
+}
+static uint32_t mapKey(SDL_Keycode k, SDL_Keymod mods) {
   switch (k) {
   case SDLK_RETURN:
   case SDLK_KP_ENTER:
     return LV_KEY_ENTER;
   case SDLK_TAB:
-    return LV_KEY_NEXT;
+    return (mods & KMOD_SHIFT) ? LV_KEY_PREV : LV_KEY_NEXT;
   case SDLK_BACKSPACE:
     return LV_KEY_BACKSPACE;
   case SDLK_ESCAPE:
@@ -658,78 +1026,59 @@ static uint32_t mapKey(SDL_Keycode k) {
     return LV_KEY_UP;
   case SDLK_DOWN:
     return LV_KEY_DOWN;
+  case SDLK_PAGEUP:return LV_KEY_PREV;
+  case SDLK_PAGEDOWN:return LV_KEY_NEXT;
+  case SDLK_HOME:return LV_KEY_HOME;
+  case SDLK_END:return LV_KEY_END;
   default:
-    return (k >= 32 && k < 127) ? (uint32_t)k : 0;
+    return 0;
   }
 }
 #endif
 #ifdef CPZERO_FBDEV
 static void keyRead(lv_indev_t *, lv_indev_data_t *d) {
-  static uint32_t key = 0;
-  static bool pressed = false;
   uint32_t nextKey = 0;
   bool nextPressed = false;
   bool readMore = G->framebuffer.readKey(nextKey, nextPressed);
   if (readMore) {
-    key = nextKey;
-    pressed = nextPressed;
+    G->heldKey = nextKey;
+    G->heldKeyPressed = nextPressed;
+    if(G->heldKeyPressed) { bool ctrl=false,shift=false,alt=false,meta=false; G->framebuffer.getModifiers(ctrl,shift,alt,meta); if(cpKeyConsumed(G->framebuffer.lastKeyName(),ctrl,shift,alt,meta)) { G->heldKey=0; G->heldKeyPressed=false; } }
   }
-  d->key = key;
-  d->state = pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+  d->key = G->heldKey;
+  d->state = G->heldKeyPressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
   d->continue_reading = readMore;
 }
 #else
-static uint32_t mapHostKey(int k) {
-  switch (k) {
-  case HOST_KEY_ENTER:
-    return LV_KEY_ENTER;
-  case HOST_KEY_TAB:
-    return LV_KEY_NEXT;
-  case HOST_KEY_ESCAPE:
-    return LV_KEY_ESC;
-  default:
-    return k >= 32 && k < 127 ? (uint32_t)k : 0;
-  }
-}
 static void keyRead(lv_indev_t *, lv_indev_data_t *d) {
-  static uint32_t held = 0;
-  static bool heldPressed = false;
   d->continue_reading = false;
-  if (G->keyAt < G->keys.size()) {
-    held = mapHostKey(G->keys[G->keyAt]);
-    d->state =
-        G->injectedRelease ? LV_INDEV_STATE_RELEASED : LV_INDEV_STATE_PRESSED;
-    d->key = held;
-    if (G->injectedRelease) {
-      G->injectedRelease = false;
-      G->keyAt++;
-    } else
-      G->injectedRelease = true;
-    d->continue_reading = G->keyAt < G->keys.size() || G->injectedRelease;
-    heldPressed = d->state == LV_INDEV_STATE_PRESSED;
-    return;
-  }
-  SDL_Event e;
-  while (SDL_PollEvent(&e)) {
-    if (e.type == SDL_QUIT) {
-      G->running = false;
-      continue;
-    }
+  while (!G->keyEvents.empty()) {
+    SDL_Event e=G->keyEvents.front(); G->keyEvents.pop_front();
     if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) {
-      uint32_t key = mapKey(e.key.keysym.sym);
+      if (e.type == SDL_KEYDOWN && shortcutConsumed(e.key.keysym.sym, (SDL_Keymod)e.key.keysym.mod)) {
+        SDL_Keycode k=e.key.keysym.sym;
+        if(k>=32&&k<127) { char ch=(char)k; if((e.key.keysym.mod&KMOD_SHIFT)&&std::isalpha((unsigned char)ch)) ch=(char)std::toupper((unsigned char)ch); G->suppressedText.assign(1,ch); G->suppressTextUntil=SDL_GetTicks()+150; }
+        continue;
+      }
+      if (e.type == SDL_KEYDOWN && (e.key.keysym.mod & (KMOD_CTRL|KMOD_GUI)) && e.key.keysym.sym == SDLK_v) {
+        char *clip=SDL_GetClipboardText(); if(clip){ textInput(clip); SDL_free(clip); } continue;
+      }
+      uint32_t key = mapKey(e.key.keysym.sym,(SDL_Keymod)e.key.keysym.mod);
+      if(e.key.keysym.sym==SDLK_SPACE) { lv_obj_t *focused=lv_group_get_focused(G->group); if(focused&&lv_obj_check_type(focused,&lv_button_class)) key=LV_KEY_ENTER; }
       if (!key)
         continue;
-      held = key;
+      G->heldKey = key;
       d->key = key;
       d->state = e.type == SDL_KEYDOWN ? LV_INDEV_STATE_PRESSED
                                        : LV_INDEV_STATE_RELEASED;
-      heldPressed = d->state == LV_INDEV_STATE_PRESSED;
-      d->continue_reading = false;
+      G->heldKeyPressed = d->state == LV_INDEV_STATE_PRESSED;
+      d->continue_reading = !G->keyEvents.empty();
       return;
     }
+    if(e.type==SDL_TEXTINPUT) { textInput(e.text.text); continue; }
   }
-  d->key = held;
-  d->state = heldPressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+  d->key = G->heldKey;
+  d->state = G->heldKeyPressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
 }
 #endif
 static bool screenshotWrite(Host *h, const std::string &path) {
@@ -758,6 +1107,7 @@ static void installBridge(Host *h) {
                     JS_NewCFunction(h->ctx, cpInvoke, "invoke", 3));
   JS_SetPropertyStr(h->ctx, cp, "stats",
                     JS_NewCFunction(h->ctx, cpStats, "stats", 0));
+  JS_SetPropertyStr(h->ctx, cp, "command", JS_NewCFunction(h->ctx, cpCommand, "command", 3));
   JS_SetPropertyStr(h->ctx, global, "__cp", cp);
   JS_FreeValue(h->ctx, global);
 }
@@ -776,6 +1126,7 @@ static bool loadBundle(Host *h) {
     return false;
   }
   std::string src((std::istreambuf_iterator<char>(f)), {});
+  if (h->async) { h->async->shutdown(); h->async.reset(); }
   if (h->ctx)
     JS_FreeContext(h->ctx);
   if (h->rt)
@@ -790,6 +1141,7 @@ static bool loadBundle(Host *h) {
   h->ctx = JS_NewContext(h->rt);
   if (!h->ctx)
     return false;
+  h->async = std::make_unique<cpzero::AsyncServices>();
   installBridge(h);
   h->pendingRejections.clear();
   h->appStart = Clock::now();
@@ -822,7 +1174,8 @@ static bool setupLvgl(Host *h) {
                          LV_DISPLAY_RENDER_MODE_PARTIAL);
   lv_display_set_flush_cb(h->display, flush);
   h->screen = lv_display_get_screen_active(h->display);
-  lv_obj_set_style_bg_color(h->screen, lv_color_hex(0xf7f8fa), 0);
+  lv_obj_set_style_bg_color(h->screen, lv_color_hex(0x181818), 0);
+  lv_obj_set_style_text_color(h->screen,lv_color_hex(0xe6e6e6),0);
   lv_obj_set_style_bg_opa(h->screen, LV_OPA_COVER, 0);
   lv_obj_set_flex_flow(h->screen, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_all(h->screen, 0, 0);
@@ -839,19 +1192,21 @@ static bool setupLvgl(Host *h) {
   h->keyboard = lv_indev_create();
   lv_indev_set_type(h->keyboard, LV_INDEV_TYPE_KEYPAD);
   lv_indev_set_read_cb(h->keyboard, keyRead);
+  if(auto *timer=lv_indev_get_read_timer(h->keyboard)) lv_timer_set_period(timer,8);
   lv_indev_set_group(h->keyboard, h->group);
   return true;
 }
 #ifndef CPZERO_FBDEV
 static bool setupSdl(Host *h) {
+  SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY,"0");
   if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
     std::cerr << "SDL: " << SDL_GetError() << "\n";
     return false;
   }
-  if (!h->headless)
+  if (!h->headless || h->clickX>=0)
     h->window = SDL_CreateWindow("CPZeroJS", SDL_WINDOWPOS_CENTERED,
                                  SDL_WINDOWPOS_CENTERED, W * h->scale,
-                                 H * h->scale, SDL_WINDOW_SHOWN);
+                                 H * h->scale, h->headless?SDL_WINDOW_HIDDEN:SDL_WINDOW_SHOWN);
   if (h->window) {
     h->renderer = SDL_CreateRenderer(
         h->window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
@@ -863,6 +1218,7 @@ static bool setupSdl(Host *h) {
     h->texture = SDL_CreateTexture(h->renderer, SDL_PIXELFORMAT_ARGB8888,
                                    SDL_TEXTUREACCESS_STREAMING, W, H);
   }
+  SDL_StartTextInput();
   return true;
 }
 #else
@@ -879,6 +1235,7 @@ static bool setupPlatform(Host *h) {
 #endif
 
 static void teardownUI(Host *h) {
+  while(!h->focusScopes.empty()) endFocusScope(h,0);
   for (auto &kv : h->widgets) {
     if (kv.second.parent == 0)
       lv_obj_delete(kv.second.obj);
@@ -910,6 +1267,14 @@ int main(int argc, char **argv) {
       h.frames = std::max(1, atoi(argv[++i]));
     else if (a == "--screenshot" && i + 1 < argc)
       h.screenshot = argv[++i];
+    else if (a == "--text" && i + 1 < argc)
+      h.injectText = argv[++i];
+    else if (a == "--click" && i + 1 < argc) {
+      std::string pos=argv[++i]; auto comma=pos.find(',');
+      if(comma==std::string::npos) { usage(); return 2; }
+      h.clickX=std::clamp(std::atoi(pos.substr(0,comma).c_str()),0,W-1);
+      h.clickY=std::clamp(std::atoi(pos.substr(comma+1).c_str()),0,H-1);
+    }
     else if (a == "--keys" && i + 1 < argc) {
       std::stringstream ss(argv[++i]);
       std::string k;
@@ -918,11 +1283,25 @@ int main(int argc, char **argv) {
           h.keys.push_back(HOST_KEY_ENTER);
         else if (k == "Tab")
           h.keys.push_back(HOST_KEY_TAB);
+        else if (k == "ShiftTab") h.keys.push_back(HOST_KEY_SHIFTTAB);
         else if (k == "Escape")
           h.keys.push_back(HOST_KEY_ESCAPE);
+        else if(k=="ArrowUp") h.keys.push_back(HOST_KEY_UP);
+        else if(k=="ArrowDown") h.keys.push_back(HOST_KEY_DOWN);
+        else if(k=="ArrowLeft") h.keys.push_back(HOST_KEY_LEFT);
+        else if(k=="ArrowRight") h.keys.push_back(HOST_KEY_RIGHT);
+        else if(k=="PageUp") h.keys.push_back(HOST_KEY_PAGEUP);
+        else if(k=="PageDown") h.keys.push_back(HOST_KEY_PAGEDOWN);
+        else if(k=="Home") h.keys.push_back(HOST_KEY_HOME);
+        else if(k=="End") h.keys.push_back(HOST_KEY_END);
+        else if(k=="Backspace") h.keys.push_back(HOST_KEY_BACKSPACE);
         else if (k.size() == 1)
           h.keys.push_back((int)k[0]);
       }
+    } else if (a == "--keys-batch" && i + 1 < argc) {
+      h.keysBatch=true;
+      std::stringstream ss(argv[++i]); std::string k;
+      while(std::getline(ss,k,',')) { if(k=="Enter")h.keys.push_back(HOST_KEY_ENTER); else if(k=="Tab")h.keys.push_back(HOST_KEY_TAB); else if(k=="ShiftTab")h.keys.push_back(HOST_KEY_SHIFTTAB); else if(k=="Escape")h.keys.push_back(HOST_KEY_ESCAPE); else if(k=="ArrowUp")h.keys.push_back(HOST_KEY_UP); else if(k=="ArrowDown")h.keys.push_back(HOST_KEY_DOWN); else if(k.size()==1)h.keys.push_back((int)(unsigned char)k[0]); }
     } else {
       usage();
       return 2;
@@ -957,7 +1336,10 @@ int main(int argc, char **argv) {
   while (h.running && (h.frames < 0 || h.frame < h.frames)) {
     auto start = Clock::now();
 #ifndef CPZERO_FBDEV
-    SDL_PumpEvents();
+    pushClick(&h);
+    pushKeys(&h);
+    if(!h.injectText.empty()&&!h.textInjected) { pushText(&h,h.injectText); h.textInjected=true; }
+    pollSdlEvents(&h);
 #endif
     uint64_t t =
         (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -971,9 +1353,12 @@ int main(int argc, char **argv) {
       break;
     }
     JS_FreeValue(h.ctx, tick);
-    if (h.keyAt < h.keys.size())
-      lv_indev_read(h.keyboard);
+#ifndef CPZERO_FBDEV
+    if (!h.keyEvents.empty()) lv_indev_read(h.keyboard);
+    flushPointerEvents(&h);
+#endif
     lv_timer_handler();
+    if(h.screenshotRequested) { if(!screenshotWrite(&h,h.screenshot)) std::cerr<<"Could not write screenshot: "<<h.screenshot<<"\n"; else std::cerr<<"Screenshot saved: "<<h.screenshot<<"\n"; h.screenshotRequested=false; }
     if (!h.running)
       break;
     if (!h.screenshot.empty() && h.frame == 0) {
@@ -1023,6 +1408,7 @@ int main(int argc, char **argv) {
     }
   }
   teardownUI(&h);
+  if (h.async) { h.async->shutdown(); h.async.reset(); }
   if (h.ctx)
     JS_FreeContext(h.ctx);
   if (h.rt)

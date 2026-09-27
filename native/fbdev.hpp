@@ -4,6 +4,7 @@
 // The target image must expose a 320x170 framebuffer and a keyboard evdev node.
 #ifdef __linux__
 #include <cerrno>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
@@ -25,6 +26,8 @@ class Framebuffer {
   fb_var_screeninfo info_{};
   fb_fix_screeninfo fixed_{};
   bool shift_ = false;
+  bool ctrl_ = false, alt_ = false, meta_ = false;
+  std::string lastKeyName_;
 
   static uint32_t channel(uint32_t value, fb_bitfield field) {
     if (field.length == 0)
@@ -153,42 +156,58 @@ public:
         shift_ = event.value != 0;
         continue;
       }
+      if (event.code == KEY_LEFTCTRL || event.code == KEY_RIGHTCTRL) { ctrl_=event.value!=0; continue; }
+      if (event.code == KEY_LEFTALT || event.code == KEY_RIGHTALT) { alt_=event.value!=0; continue; }
+      if (event.code == KEY_LEFTMETA || event.code == KEY_RIGHTMETA) { meta_=event.value!=0; continue; }
+      lastKeyName_.clear();
       switch (event.code) {
       case KEY_ENTER:
         key = LV_KEY_ENTER;
+        lastKeyName_="Enter";
         break;
       case KEY_TAB:
         key = shift_ ? LV_KEY_PREV : LV_KEY_NEXT;
+        lastKeyName_="Tab";
         break;
       case KEY_ESC:
         key = LV_KEY_ESC;
+        lastKeyName_="Escape";
         break;
       case KEY_BACKSPACE:
         key = LV_KEY_BACKSPACE;
+        lastKeyName_="Backspace";
         break;
       case KEY_DELETE:
         key = LV_KEY_DEL;
+        lastKeyName_="Delete";
         break;
       case KEY_LEFT:
         key = LV_KEY_LEFT;
+        lastKeyName_="ArrowLeft";
         break;
       case KEY_RIGHT:
         key = LV_KEY_RIGHT;
+        lastKeyName_="ArrowRight";
         break;
       case KEY_UP:
         key = LV_KEY_UP;
+        lastKeyName_="ArrowUp";
         break;
       case KEY_DOWN:
         key = LV_KEY_DOWN;
+        lastKeyName_="ArrowDown";
         break;
       case KEY_HOME:
         key = LV_KEY_HOME;
+        lastKeyName_="Home";
         break;
       case KEY_END:
         key = LV_KEY_END;
+        lastKeyName_="End";
         break;
       case KEY_SPACE:
         key = ' ';
+        lastKeyName_=" ";
         break;
       default: {
         static constexpr char top[] = "qwertyuiop";
@@ -243,12 +262,18 @@ public:
         }
         if (shift_ && key >= 'a' && key <= 'z')
           key -= 'a' - 'A';
+        lastKeyName_=std::string(1,static_cast<char>(std::tolower(static_cast<unsigned char>(key))));
       }
       }
       pressed = event.value != 0;
       return true;
     }
     return false;
+  }
+
+  const std::string &lastKeyName() const { return lastKeyName_; }
+  void getModifiers(bool &ctrl, bool &shift, bool &alt, bool &meta) const {
+    ctrl=ctrl_; shift=shift_; alt=alt_; meta=meta_;
   }
 };
 } // namespace cpzero

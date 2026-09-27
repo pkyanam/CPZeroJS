@@ -20,6 +20,8 @@ npm run dev
 
 The first native build fetches pinned LVGL and QuickJS sources through CMake, so it needs network access.
 
+The v0.2 HTTP host also links libcurl. Install the package with headers on macOS (`brew install curl`) if CMake cannot find it. Codex demo use additionally requires the Codex CLI to be installed and signed in on the same machine; the demo starts that CLI and uses its existing account/configuration. No API key is needed by the app.
+
 The default app is `examples/dashboard/src/main.ts`. The SDL simulator has a fixed 320 × 170 logical display at 3× scale by default. The scale changes presentation size, not app coordinates.
 
 During `cpzero dev`, source changes trigger a bundle rebuild and host reload. Reloading replaces the JavaScript context and UI, so in-memory app state starts over. Save durable user data through the storage service instead.
@@ -60,3 +62,5 @@ createApp({ title: "Hello", setup(root) {
 ```
 
 The `root` provided to `setup` is the app screen. See the [API reference](api.md) for supported widgets and properties. The runtime has no JSX, Node.js APIs, or browser DOM.
+
+The SDL simulator supports keyboard and mouse input. Use Tab/Shift+Tab to move focus, Enter to activate a focused button, type into a focused input, and use the wheel or keyboard navigation to scroll. Mouse users can click controls and scroll normally. Build compact screens for keyboard operation first; simulator behavior does not prove Linux device input works.
