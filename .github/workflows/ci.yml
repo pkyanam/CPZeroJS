@@ -22,12 +22,12 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm run native
-      - run: npm run test:native
       - name: Compile Linux framebuffer backend
         if: runner.os == 'Linux'
         run: |
           cmake -S native -B native/build-fbdev -DCPZERO_BACKEND=FBDEV -DCMAKE_BUILD_TYPE=Release
           cmake --build native/build-fbdev --parallel 2
+      - run: npm run test:native
       - uses: actions/upload-artifact@v4
         with:
           name: preview-${{ matrix.os }}

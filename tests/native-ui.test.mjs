@@ -13,7 +13,7 @@ async function run(source, args = []) {
   try {
     const bundle = path.join(dir, 'app.js');
     await build({ stdin: { contents: source, resolveDir: root, loader: 'ts' }, outfile: bundle, bundle: true, format: 'iife', target: 'es2020', alias: { '@cpzero/core': path.join(root, 'packages/core/src/index.ts') } });
-    return spawnSync(host, [bundle, '--headless', '--frames', '20', ...args], { encoding: 'utf8', timeout: 5000, env: { ...process.env, SDL_VIDEODRIVER: 'dummy', CPZERO_DATA_DIR: path.join(dir, 'data') } });
+    return spawnSync(host, [bundle, '--headless', '--frames', '20', ...args], { encoding: 'utf8', timeout: 5000, env: { ...process.env, SDL_VIDEODRIVER: 'dummy', CPZERO_DEBUG_INPUT: '1', CPZERO_DATA_DIR: path.join(dir, 'data') } });
   } finally { await rm(dir, { recursive: true, force: true }); }
 }
 
@@ -66,13 +66,13 @@ test('one SDL Tab press is released instead of repeating indefinitely', async ()
 test('logical mouse click uses the LVGL pointer input path', async () => {
   const r = await run(`import {createApp,ui,log} from '@cpzero/core';createApp({setup(root){const layout=ui.column(root,{width:320,height:170,padding:0,gap:0});ui.box(layout,{width:120,height:80});const row=ui.row(layout,{width:320,height:30,gap:0});ui.box(row,{width:100,height:30});ui.button(row,{text:'Click',width:80,height:30,onPress(){log('MOUSE_PRESS')}})}});`, ['--scale','4','--click', '110,90']);
   assert.equal(r.status, 0, r.stderr);
-  assert.equal([...r.stdout.matchAll(/MOUSE_PRESS/g)].length,2,'rapid SDL down/up pairs must both be delivered');
+  assert.equal([...r.stdout.matchAll(/MOUSE_PRESS/g)].length,2,'rapid SDL down/up pairs must both be delivered\n' + r.stderr);
 });
 
 test('a click focuses an input before queued text is delivered in the same frame', async () => {
-  const r = await run(`import {createApp,ui,log} from '@cpzero/core';createApp({setup(root){const row=ui.row(root,{width:320,height:30,gap:0});ui.button(row,{text:'Other',width:60,height:30});ui.input(row,{width:180,height:30,value:'',onChange:v=>log('VALUE:'+v)});}});`, ['--scale','4','--click','70,10','--text','hello']);
+  const r = await run(`import {createApp,ui,log} from '@cpzero/core';createApp({setup(root){const layout=ui.column(root,{width:320,height:100,padding:0,gap:0});ui.box(layout,{width:320,height:60});const row=ui.row(layout,{width:320,height:30,gap:0});ui.button(row,{text:'Other',width:60,height:30});ui.box(row,{width:40,height:30});ui.input(row,{width:180,height:30,value:'',onChange:v=>log('VALUE:'+v)});}});`, ['--scale','4','--click','110,70','--text','hello']);
   assert.equal(r.status,0,r.stderr);
-  assert.match(r.stdout,/VALUE:hello/);
+  assert.match(r.stdout,/VALUE:hello/, r.stderr);
 });
 
 test('rich text spans render with mixed styles and reject unbounded input', async () => {

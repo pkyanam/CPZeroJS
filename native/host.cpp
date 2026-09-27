@@ -952,6 +952,7 @@ static void routeSdlEvent(Host *h,const SDL_Event &e) {
   }
 }
 static void pollSdlEvents(Host *h) {
+  if(h->screen) lv_obj_update_layout(h->screen);
   SDL_Event e; bool injectedText=false;
   while(SDL_PollEvent(&e)) {
     if(!injectedText && (e.type==SDL_KEYDOWN||e.type==SDL_KEYUP||e.type==SDL_TEXTINPUT)) {
@@ -1334,6 +1335,7 @@ int main(int argc, char **argv) {
     JS_FreeRuntime(h.rt);
     return 1;
   }
+  lv_obj_update_layout(h.screen);
   auto stamp = fs::last_write_time(h.bundle);
   auto reloadAt = Clock::now();
   while (h.running && (h.frames < 0 || h.frame < h.frames)) {
@@ -1382,7 +1384,7 @@ int main(int argc, char **argv) {
           std::cerr << "Reload failed; host stopped.\n";
           h.running = false;
         } else
-          std::cerr << "Reloaded " << h.bundle << "\n";
+          { lv_obj_update_layout(h.screen); std::cerr << "Reloaded " << h.bundle << "\n"; }
       }
     }
 #ifdef CPZERO_FBDEV
