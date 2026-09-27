@@ -979,7 +979,9 @@ static void pushClick(Host *h) {
   const int x=h->clickX*h->scale,y=h->clickY*h->scale;
   SDL_Event down{}; down.type=SDL_MOUSEBUTTONDOWN; down.button.button=SDL_BUTTON_LEFT; down.button.state=SDL_PRESSED; down.button.x=x; down.button.y=y; down.button.windowID=SDL_GetWindowID(h->window);
   SDL_Event up=down; up.type=SDL_MOUSEBUTTONUP; up.button.state=SDL_RELEASED;
-  for(int i=0;i<2;++i) if(SDL_PushEvent(&down)<0 || SDL_PushEvent(&up)<0) std::cerr<<"SDL click injection failed: "<<SDL_GetError()<<"\n";
+  // SDL event filters may modify the event passed to SDL_PushEvent.
+  // Fresh copies prevent a second click from being scaled twice.
+  for(int i=0;i<2;++i) { SDL_Event press=down,release=up; if(SDL_PushEvent(&press)<0 || SDL_PushEvent(&release)<0) std::cerr<<"SDL click injection failed: "<<SDL_GetError()<<"\n"; }
   h->clickInjected=true;
 }
 static void pushKeys(Host *h) {
