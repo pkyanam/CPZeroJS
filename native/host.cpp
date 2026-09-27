@@ -892,6 +892,7 @@ static void pointerRead(lv_indev_t *, lv_indev_data_t *d) {
   if(!G->pointerEvents.empty()) {
     PointerSample sample=G->pointerEvents.front(); G->pointerEvents.pop_front();
     G->pointerX=sample.x; G->pointerY=sample.y; G->pointerPressed=sample.pressed;
+    if(std::getenv("CPZERO_DEBUG_INPUT")) std::cerr<<"pointer sample logical="<<sample.x<<","<<sample.y<<" pressed="<<sample.pressed<<" remaining="<<G->pointerEvents.size()<<"\n";
   }
   d->point.x=G->pointerX; d->point.y=G->pointerY;
   d->state=G->pointerPressed?LV_INDEV_STATE_PRESSED:LV_INDEV_STATE_RELEASED;
@@ -929,12 +930,12 @@ static void routeSdlEvent(Host *h,const SDL_Event &e) {
   if(e.type==SDL_QUIT) { h->running=false; return; }
   if(e.type==SDL_WINDOWEVENT && e.window.event==SDL_WINDOWEVENT_FOCUS_LOST) {
     h->keyEvents.clear(); h->heldKey=0; h->heldKeyPressed=false;
-    if(h->pointerPressed) enqueuePointer(h,h->pointerX*h->scale,h->pointerY*h->scale,false,true);
+    if(h->pointerPressed) enqueuePointer(h,h->pointerX,h->pointerY,false,true);
     return;
   }
-  if(e.type==SDL_MOUSEMOTION) { enqueuePointer(h,e.motion.x,e.motion.y,(e.motion.state&SDL_BUTTON_LMASK)!=0,false); return; }
+  if(e.type==SDL_MOUSEMOTION) { if(std::getenv("CPZERO_DEBUG_INPUT")){auto p=logicalPoint(h,e.motion.x,e.motion.y);std::cerr<<"SDL motion raw="<<e.motion.x<<","<<e.motion.y<<" logical="<<p.x<<","<<p.y<<"\n";} enqueuePointer(h,e.motion.x,e.motion.y,(e.motion.state&SDL_BUTTON_LMASK)!=0,false); return; }
   if(e.type==SDL_MOUSEBUTTONDOWN||e.type==SDL_MOUSEBUTTONUP) {
-    if(e.button.button==SDL_BUTTON_LEFT) enqueuePointer(h,e.button.x,e.button.y,e.type==SDL_MOUSEBUTTONDOWN,true);
+    if(e.button.button==SDL_BUTTON_LEFT) { if(std::getenv("CPZERO_DEBUG_INPUT")){auto p=logicalPoint(h,e.button.x,e.button.y);int lx=0,ly=0,gx=0,gy=0,wx=0,wy=0;Uint32 buttons=SDL_GetMouseState(&lx,&ly);Uint32 globalButtons=SDL_GetGlobalMouseState(&gx,&gy);SDL_GetWindowPosition(h->window,&wx,&wy);std::cerr<<"SDL button "<<(e.type==SDL_MOUSEBUTTONDOWN?"down":"up")<<" raw="<<e.button.x<<","<<e.button.y<<" logical="<<p.x<<","<<p.y<<" clicks="<<(int)e.button.clicks<<" eventWindow="<<e.button.windowID<<" ownWindow="<<SDL_GetWindowID(h->window)<<" localNow="<<lx<<","<<ly<<" buttons="<<buttons<<" globalNow="<<gx<<","<<gy<<" globalButtons="<<globalButtons<<" windowOrigin="<<wx<<","<<wy<<" mouseFocus="<<(SDL_GetMouseFocus()==h->window)<<"\n";} enqueuePointer(h,e.button.x,e.button.y,e.type==SDL_MOUSEBUTTONDOWN,true); }
     return;
   }
   if(e.type==SDL_MOUSEWHEEL) {
@@ -1199,6 +1200,7 @@ static bool setupLvgl(Host *h) {
 #ifndef CPZERO_FBDEV
 static bool setupSdl(Host *h) {
   SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY,"0");
+  SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH,"1");
   if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
     std::cerr << "SDL: " << SDL_GetError() << "\n";
     return false;
@@ -1215,6 +1217,7 @@ static bool setupSdl(Host *h) {
     if (!h->renderer)
       return false;
     SDL_RenderSetLogicalSize(h->renderer, W, H);
+    if(std::getenv("CPZERO_DEBUG_INPUT")){int ww=0,wh=0,rw=0,rh=0,lw=0,lh=0;SDL_GetWindowSize(h->window,&ww,&wh);SDL_GetRendererOutputSize(h->renderer,&rw,&rh);SDL_RenderGetLogicalSize(h->renderer,&lw,&lh);std::cerr<<"SDL geometry window="<<ww<<"x"<<wh<<" output="<<rw<<"x"<<rh<<" logical="<<lw<<"x"<<lh<<" scale="<<h->scale<<"\n";}
     h->texture = SDL_CreateTexture(h->renderer, SDL_PIXELFORMAT_ARGB8888,
                                    SDL_TEXTUREACCESS_STREAMING, W, H);
   }

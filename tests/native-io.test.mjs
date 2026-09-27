@@ -16,7 +16,7 @@ async function run(source, frames = 100) {
   try {
     return await new Promise((resolve, reject) => {
       const child = spawn(host, [bundle, '--headless', '--frames', String(frames)], { env: { ...process.env, SDL_VIDEODRIVER: 'dummy', CPZERO_DATA_DIR: path.join(dir, 'data') } });
-      let output = ''; const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error(`native I/O test timed out\n${output}`)); }, 8000);
+      let output = ''; const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error(`native I/O test timed out\n${output}`)); }, Math.max(8000, frames * 20 + 2000));
       child.stdout.on('data', x => output += x); child.stderr.on('data', x => output += x);
       child.once('error', e => { clearTimeout(timer); reject(e); });
       child.once('close', code => { clearTimeout(timer); if (code !== 0) reject(new Error(`host exited ${code}\n${output}`)); else resolve(output); });
