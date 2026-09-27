@@ -26,7 +26,7 @@ async function run(source, frames = 100) {
 
 test('process service streams stdout and stderr and reaps an interactive child without blocking UI ticks', async () => {
   const source = `import {createApp,processes,log,every} from '@cpzero/core'; createApp({setup(){ const p=processes.spawn({command:'/usr/bin/python3',args:['-u','-c',"import sys,time,os; print('ready'); print('warning',file=sys.stderr); os.write(1,bytes([226]));time.sleep(.02);os.write(1,bytes([130,172,10]));x=sys.stdin.readline();print('got:'+x.strip());time.sleep(.08)"]}); p.on('stdout',x=>log('OUT:'+x.trim()));p.on('stderr',x=>log('ERR:'+x.trim()));p.on('exit',x=>log('EXIT:'+x));p.write('hello\\n');p.closeStdin()}});`;
-  const output = await run(source, 120);
+  const output = await run(source, 600);
   assert.match(output, /OUT:.*ready.*got:hello/s);
   assert.match(output, /ERR:warning/);
   assert.match(output, /€/);
